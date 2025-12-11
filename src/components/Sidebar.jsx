@@ -71,8 +71,8 @@ export function Sidebar({
     onMazeWallsChange,
     onMazeChange
 }) {
-    const [ipAddress, setIpAddress] = useState('192.168.43.100');
-    const [port, setPort] = useState('81');
+    const [ipAddress, setIpAddress] = useState('botvisualizer-production.up.railway.app');  // Update after deploying
+    const [port, setPort] = useState('443');
     const [isDemoMode, setIsDemoMode] = useState(false);
     const [activeTab, setActiveTab] = useState('controls');
     const demoIntervalRef = useRef(null);
@@ -235,7 +235,7 @@ export function Sidebar({
                                     type="text"
                                     value={ipAddress}
                                     onChange={(e) => setIpAddress(e.target.value)}
-                                    placeholder="192.168.43.100"
+                                    placeholder="your-app.up.railway.app"
                                     disabled={isConnected || isConnecting}
                                     className={`w-full bg-[#1e293b]/50 border rounded-lg py-2 px-3 text-sm font-mono text-cyan-300 placeholder-slate-600 outline-none transition-all ${borderGlow}`}
                                 />

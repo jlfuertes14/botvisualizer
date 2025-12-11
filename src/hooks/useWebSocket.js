@@ -79,17 +79,28 @@ export function useWebSocket() {
         setError(null);
 
         try {
-            const wsUrl = `ws://${ipAddress}:${port}`;
+            // Use wss:// for Railway (port 443), ws:// for local
+            const protocol = port === '443' || port === 443 ? 'wss' : 'ws';
+            const wsUrl = port === '443' || port === 443
+                ? `${protocol}://${ipAddress}`
+                : `${protocol}://${ipAddress}:${port}`;
             console.log(`Connecting to ${wsUrl}...`);
 
             const ws = new WebSocket(wsUrl);
             wsRef.current = ws;
 
             ws.onopen = () => {
-                console.log('WebSocket connected!');
+                console.log('WebSocket connected to bridge server!');
                 setIsConnected(true);
                 setIsConnecting(false);
                 setError(null);
+
+                // Send identification to bridge server
+                ws.send(JSON.stringify({
+                    type: 'identify',
+                    client: 'browser'
+                }));
+                console.log('Sent browser identification to bridge');
             };
 
             ws.onmessage = (event) => {

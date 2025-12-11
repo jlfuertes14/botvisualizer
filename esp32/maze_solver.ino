@@ -9,7 +9,7 @@
  */
 
 #include <WiFi.h>
-#include <WebSocketsServer.h>
+#include <WebSocketsClient.h>
 #include <Wire.h>
 #include <ArduinoJson.h>
 
@@ -135,9 +135,12 @@ float targetHeading = 0;
 float lastError = 0;
 float integral = 0;
 
-// ======================= WEBSOCKET =======================
+// ======================= WEBSOCKET CLIENT =======================
 
-WebSocketsServer webSocket(81);
+// Railway bridge server (UPDATE THIS after deploying!)
+const char* WS_SERVER_HOST = "botvisualizer-production.up.railway.app";  // Replace with your Railway URL
+
+WebSocketsClient webSocket;
 bool clientConnected = false;
 
 // ======================= FUNCTION DECLARATIONS =======================
@@ -458,19 +461,33 @@ void IRAM_ATTR onLineCrossed() {
     cellCrossed = true;
 }
 
-// ======================= WEBSOCKET HANDLER =======================
+// ======================= WEBSOCKET CLIENT HANDLER =======================
 
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     switch(type) {
         case WStype_DISCONNECTED:
-            Serial.printf("[%u] Disconnected!\n", num);
+            Serial.println("WebSocket disconnected!");
             clientConnected = false;
             break;
         case WStype_CONNECTED:
-            Serial.printf("[%u] Connected!\n", num);
+            Serial.println("WebSocket connected to bridge server!");
             clientConnected = true;
+            // Send identification message
+            {
+                StaticJsonDocument<64> doc;
+                doc["type"] = "identify";
+                doc["client"] = "esp32";
+                String json;
+                serializeJson(doc, json);
+                webSocket.sendTXT(json);
+                Serial.println("Sent identification to bridge");
+            }
             break;
         case WStype_TEXT:
+            // Handle commands from browser (if any)
+            break;
+        case WStype_ERROR:
+            Serial.println("WebSocket error!");
             break;
     }
 }
@@ -490,9 +507,9 @@ void setup() {
     
     initQLearning();
     
-    // Static IP configuration for POCO hotspot
-    IPAddress local_IP(192, 168, 43, 100);   // ESP32's static IP
-    IPAddress gateway(192, 168, 43, 1);      // Hotspot gateway (usually .1)
+    // Static IP configuration for your network
+    IPAddress local_IP(172, 28, 182, 100);   // ESP32's static IP
+    IPAddress gateway(172, 28, 182, 3);      // Your network gateway
     IPAddress subnet(255, 255, 255, 0);
     IPAddress dns(8, 8, 8, 8);               // Google DNS
     
@@ -510,9 +527,11 @@ void setup() {
     Serial.print("Connected with static IP: ");
     Serial.println(WiFi.localIP());
     
-    webSocket.begin();
+    // Connect to Railway WebSocket bridge server (Secure WebSocket)
+    webSocket.beginSSL(WS_SERVER_HOST, 443, "/");
     webSocket.onEvent(webSocketEvent);
-    Serial.println("WebSocket server started on port 81");
+    webSocket.setReconnectInterval(5000);
+    Serial.printf("Connecting to WebSocket bridge at wss://%s\n", WS_SERVER_HOST);
     
     robotState = STATE_CALIBRATING;
     Serial.println("Robot ready! Place on START and press boot button.");
@@ -728,7 +747,7 @@ void sendTelemetry() {
     doc["isGoal"] = isAtGoal;
     String json;
     serializeJson(doc, json);
-    webSocket.broadcastTXT(json);
+    webSocket.sendTXT(json);
 }
 
 void sendEpisodeComplete() {
@@ -741,5 +760,5 @@ void sendEpisodeComplete() {
     doc["solved"] = isAtGoal;
     String json;
     serializeJson(doc, json);
-    webSocket.broadcastTXT(json);
+    webSocket.sendTXT(json);
 }

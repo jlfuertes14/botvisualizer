@@ -15,8 +15,8 @@ export function Dashboard({
     onDisconnect,
     onDemoData
 }) {
-    const [ipAddress, setIpAddress] = useState('192.168.43.100');
-    const [port, setPort] = useState('81');
+    const [ipAddress, setIpAddress] = useState('YOUR-APP.up.railway.app');  // Update after deploying
+    const [port, setPort] = useState('443');
     const [isDemoMode, setIsDemoMode] = useState(false);
     const demoIntervalRef = useRef(null);
 
@@ -128,7 +128,7 @@ export function Dashboard({
                             type="text"
                             value={ipAddress}
                             onChange={(e) => setIpAddress(e.target.value)}
-                            placeholder="192.168.43.100"
+                            placeholder="your-app.up.railway.app"
                             className="w-full"
                             disabled={isConnected || isConnecting}
                         />
