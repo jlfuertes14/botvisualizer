@@ -1,19 +1,11 @@
 /*
- * Maze Solver Bot - ESP32 Q-Learning Firmware (Single File Version)
- * 
- * Hardware:
+ * Maze Solver Bot - ESP32 Q-Learning Firmware (L298N Version)
+ * * Hardware:
  * - ESP32 DevKit
- * - 3x HC-SR04 Ultrasonic Sensors (Front, Left, Right)
- * - 1x TCRT5000 Line Sensor (Blue, facing down)
- * - MPU6050 IMU (Precise turning)
- * - TB6612FNG Motor Driver
- * 
- * Marker System:
- * - Single line: Cell boundary
- * - Double line: START position
- * - Triple line: GOAL
- * 
- * Note: Uses ESP32 Arduino Core 3.x LEDC API
+ * - 3x HC-SR04 Ultrasonic Sensors
+ * - 1x TCRT5000 Line Sensor
+ * - MPU6050 IMU
+ * - L298N Motor Driver (Replaces TB6612FNG)
  */
 
 #include <WiFi.h>
@@ -24,43 +16,46 @@
 // ======================= CONFIGURATION =======================
 
 // WiFi Credentials
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID = "POCO X7 Pro";
+const char* WIFI_PASSWORD = "12345678";
 
 // ======================= PIN DEFINITIONS =======================
 
 // HC-SR04 Ultrasonic Sensors
-#define FRONT_TRIG_PIN 12
-#define FRONT_ECHO_PIN 14
-#define LEFT_TRIG_PIN 27
-#define LEFT_ECHO_PIN 26
-#define RIGHT_TRIG_PIN 25
-#define RIGHT_ECHO_PIN 33
+#define FRONT_TRIG_PIN 14
+#define FRONT_ECHO_PIN 35
+#define LEFT_TRIG_PIN 18
+#define LEFT_ECHO_PIN 13
+#define RIGHT_TRIG_PIN 16
+#define RIGHT_ECHO_PIN 34
 
-// TCRT5000 Line Sensor (facing down, on back of robot)
-#define LINE_SENSOR_PIN 34
-#define LINE_THRESHOLD 2048  // Analog threshold for line detection (adjust as needed)
+// TCRT5000 Line Sensor (facing down)
+#define LINE_SENSOR_PIN 4
+#define LINE_THRESHOLD 2048
 
-// TB6612FNG Motor Driver
-#define MOTOR_STBY 4
-#define MOTOR_AIN1 16
-#define MOTOR_AIN2 17
-#define MOTOR_PWMA 5
-#define MOTOR_BIN1 18
-#define MOTOR_BIN2 19
-#define MOTOR_PWMB 21
+// L298N Motor Driver
+// Left Motor
+#define MOTOR_IN1 19
+#define MOTOR_IN2 21
+#define MOTOR_ENA 25 
+
+// Right Motor
+#define MOTOR_IN3 22
+#define MOTOR_IN4 23
+#define MOTOR_ENB 26  // CHANGED: Moved to Pin 4 (Old STBY) to avoid conflict with SDA (21)
 
 // MPU6050 (I2C)
-#define MPU6050_SDA 21
-#define MPU6050_SCL 22
+#define MPU6050_SDA 32 // Fixed: SDA is now exclusive to this pin
+#define MPU6050_SCL 33
 
 // ======================= THRESHOLDS =======================
 
 // Wall detection threshold (cm)
-#define WALL_THRESHOLD 15
+#define WALL_THRESHOLD 5
 
 // Motor speed (0-255)
-#define BASE_SPEED 150
+// Increased speeds slightly because L298N has a 2V voltage drop
+#define BASE_SPEED 100 
 #define TURN_SPEED 120
 
 // PID constants for straight driving
@@ -73,28 +68,24 @@ const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
 // ======================= MOTOR CONSTANTS =======================
 
-// PWM settings (ESP32 3.x uses pin-based API, channels are auto-assigned)
 #define PWM_FREQ 5000
 #define PWM_RESOLUTION 8
 
 // ======================= MPU6050 CONSTANTS =======================
 
-// MPU6050 I2C address
 #define MPU6050_ADDR 0x68
 
 // ======================= Q-LEARNING =======================
 
 #define MAZE_SIZE 5
-#define NUM_STATES (MAZE_SIZE * MAZE_SIZE)  // 25 states
-#define NUM_ACTIONS 4  // Forward, Right, Backward, Left
+#define NUM_STATES (MAZE_SIZE * MAZE_SIZE)
+#define NUM_ACTIONS 4 
 
-// Q-Table: Q[state][action]
 float Q[NUM_STATES][NUM_ACTIONS];
 
-// Learning parameters
 float alpha = 0.3;      // Learning rate
-float gamma_rl = 0.9;   // Discount factor (renamed to avoid conflict)
-float epsilon = 0.5;    // Exploration rate (starts high, decreases)
+float gamma_rl = 0.9;   // Discount factor
+float epsilon = 0.5;    // Exploration rate
 float epsilonDecay = 0.95;
 float epsilonMin = 0.1;
 
@@ -102,9 +93,8 @@ float epsilonMin = 0.1;
 
 int currentX = 0;
 int currentY = 0;
-int heading = 0;  // 0=NORTH, 1=EAST, 2=SOUTH, 3=WEST
+int heading = 0; // 0=NORTH, 1=EAST, 2=SOUTH, 3=WEST
 
-// Heading enums
 enum { NORTH = 0, EAST = 1, SOUTH = 2, WEST = 3 };
 
 // ======================= STATE MACHINE =======================
@@ -165,8 +155,8 @@ bool isOnLine();
 
 // Motors
 void initMotors();
-void setMotorA(int speed);
-void setMotorB(int speed);
+void setMotorLeft(int speed);
+void setMotorRight(int speed);
 void setMotors(int leftSpeed, int rightSpeed);
 void stopMotors();
 void driveForward(int speed = BASE_SPEED);
@@ -217,112 +207,83 @@ void initSensors() {
 }
 
 float readDistance(int trigPin, int echoPin) {
-    // Send trigger pulse
     digitalWrite(trigPin, LOW);
     delayMicroseconds(2);
     digitalWrite(trigPin, HIGH);
     delayMicroseconds(10);
     digitalWrite(trigPin, LOW);
     
-    // Read echo
-    long duration = pulseIn(echoPin, HIGH, 30000);  // 30ms timeout
+    long duration = pulseIn(echoPin, HIGH, 30000); // 30ms timeout
     
-    if (duration == 0) {
-        return 999.0;  // No echo received
-    }
+    if (duration == 0) return 999.0;
     
-    // Calculate distance in cm
-    float distance = duration * 0.034 / 2.0;
-    return distance;
+    return duration * 0.034 / 2.0;
 }
 
-float readFrontDistance() {
-    return readDistance(FRONT_TRIG_PIN, FRONT_ECHO_PIN);
-}
+float readFrontDistance() { return readDistance(FRONT_TRIG_PIN, FRONT_ECHO_PIN); }
+float readLeftDistance() { return readDistance(LEFT_TRIG_PIN, LEFT_ECHO_PIN); }
+float readRightDistance() { return readDistance(RIGHT_TRIG_PIN, RIGHT_ECHO_PIN); }
 
-float readLeftDistance() {
-    return readDistance(LEFT_TRIG_PIN, LEFT_ECHO_PIN);
-}
-
-float readRightDistance() {
-    return readDistance(RIGHT_TRIG_PIN, RIGHT_ECHO_PIN);
-}
-
-bool isFrontWall() {
-    return readFrontDistance() < WALL_THRESHOLD;
-}
-
-bool isLeftWall() {
-    return readLeftDistance() < WALL_THRESHOLD;
-}
-
-bool isRightWall() {
-    return readRightDistance() < WALL_THRESHOLD;
-}
+bool isFrontWall() { return readFrontDistance() < WALL_THRESHOLD; }
+bool isLeftWall() { return readLeftDistance() < WALL_THRESHOLD; }
+bool isRightWall() { return readRightDistance() < WALL_THRESHOLD; }
 
 bool isOnLine() {
-    // TCRT5000 analog reading - lower values = line detected (black on white)
-    // Adjust LINE_THRESHOLD based on your surface contrast
     int sensorValue = analogRead(LINE_SENSOR_PIN);
     return sensorValue < LINE_THRESHOLD;
 }
 
-// ======================= MOTOR FUNCTIONS =======================
+// ======================= MOTOR FUNCTIONS (L298N) =======================
 
 void initMotors() {
     // Motor control pins
-    pinMode(MOTOR_STBY, OUTPUT);
-    pinMode(MOTOR_AIN1, OUTPUT);
-    pinMode(MOTOR_AIN2, OUTPUT);
-    pinMode(MOTOR_BIN1, OUTPUT);
-    pinMode(MOTOR_BIN2, OUTPUT);
+    pinMode(MOTOR_IN1, OUTPUT);
+    pinMode(MOTOR_IN2, OUTPUT);
+    pinMode(MOTOR_IN3, OUTPUT);
+    pinMode(MOTOR_IN4, OUTPUT);
     
-    // Setup PWM using ESP32 Arduino Core 3.x API
-    // ledcAttach(pin, freq, resolution) - channels are auto-assigned
-    ledcAttach(MOTOR_PWMA, PWM_FREQ, PWM_RESOLUTION);
-    ledcAttach(MOTOR_PWMB, PWM_FREQ, PWM_RESOLUTION);
+    // Setup PWM
+    ledcAttach(MOTOR_ENA, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttach(MOTOR_ENB, PWM_FREQ, PWM_RESOLUTION);
     
-    // Enable motor driver
-    digitalWrite(MOTOR_STBY, HIGH);
-    
-    Serial.println("Motors initialized");
+    Serial.println("L298N Motors initialized");
 }
 
-void setMotorA(int speed) {
+void setMotorLeft(int speed) {
     if (speed > 0) {
-        digitalWrite(MOTOR_AIN1, HIGH);
-        digitalWrite(MOTOR_AIN2, LOW);
-        ledcWrite(MOTOR_PWMA, min(speed, 255));  // ESP32 3.x uses pin, not channel
+        digitalWrite(MOTOR_IN1, HIGH);
+        digitalWrite(MOTOR_IN2, LOW);
+        ledcWrite(MOTOR_ENA, min(speed, 255));
     } else if (speed < 0) {
-        digitalWrite(MOTOR_AIN1, LOW);
-        digitalWrite(MOTOR_AIN2, HIGH);
-        ledcWrite(MOTOR_PWMA, min(-speed, 255));  // ESP32 3.x uses pin, not channel
+        digitalWrite(MOTOR_IN1, LOW);
+        digitalWrite(MOTOR_IN2, HIGH);
+        ledcWrite(MOTOR_ENA, min(-speed, 255));
     } else {
-        digitalWrite(MOTOR_AIN1, LOW);
-        digitalWrite(MOTOR_AIN2, LOW);
-        ledcWrite(MOTOR_PWMA, 0);
+        digitalWrite(MOTOR_IN1, LOW);
+        digitalWrite(MOTOR_IN2, LOW);
+        ledcWrite(MOTOR_ENA, 0);
     }
 }
 
-void setMotorB(int speed) {
+void setMotorRight(int speed) {
     if (speed > 0) {
-        digitalWrite(MOTOR_BIN1, HIGH);
-        digitalWrite(MOTOR_BIN2, LOW);
-        ledcWrite(MOTOR_PWMB, min(speed, 255));  // ESP32 3.x uses pin, not channel
+        digitalWrite(MOTOR_IN3, HIGH);
+        digitalWrite(MOTOR_IN4, LOW);
+        ledcWrite(MOTOR_ENB, min(speed, 255));
     } else if (speed < 0) {
-        digitalWrite(MOTOR_BIN1, LOW);
-        digitalWrite(MOTOR_BIN2, HIGH);
-        ledcWrite(MOTOR_PWMB, min(-speed, 255));  // ESP32 3.x uses pin, not channel
+        digitalWrite(MOTOR_IN3, LOW);
+        digitalWrite(MOTOR_IN4, HIGH);
+        ledcWrite(MOTOR_ENB, min(-speed, 255));
     } else {
-        digitalWrite(MOTOR_BIN1, LOW);
-        digitalWrite(MOTOR_BIN2, LOW);
-        ledcWrite(MOTOR_PWMB, 0);
+        digitalWrite(MOTOR_IN3, LOW);
+        digitalWrite(MOTOR_IN4, LOW);
+        ledcWrite(MOTOR_ENB, 0);
     }
 }
 
 void setMotors(int leftSpeed, int rightSpeed) {
-    setMotorA(leftSpeed);   // Left motor
-    setMotorB(rightSpeed);  // Right motor
+    setMotorLeft(leftSpeed);
+    setMotorRight(rightSpeed);
 }
 
 void stopMotors() {
@@ -355,21 +316,17 @@ void driveForwardWithCorrection() {
     float currentHeadingVal = readMPU6050Yaw();
     float error = targetHeading - currentHeadingVal;
     
-    // Normalize error to -180 to 180
     while (error > 180) error -= 360;
     while (error < -180) error += 360;
     
-    // PID calculation
     integral += error;
     float derivative = error - lastError;
     int correction = (int)(KP * error + KI * integral + KD * derivative);
     lastError = error;
     
-    // Apply correction
     int leftSpeed = BASE_SPEED + correction;
     int rightSpeed = BASE_SPEED - correction;
     
-    // Clamp speeds
     leftSpeed = constrain(leftSpeed, 0, 255);
     rightSpeed = constrain(rightSpeed, 0, 255);
     
@@ -381,19 +338,16 @@ void driveForwardWithCorrection() {
 void initMPU6050() {
     Wire.begin(MPU6050_SDA, MPU6050_SCL);
     
-    // Wake up MPU6050
     Wire.beginTransmission(MPU6050_ADDR);
-    Wire.write(0x6B);  // PWR_MGMT_1 register
-    Wire.write(0);     // Wake up
+    Wire.write(0x6B);
+    Wire.write(0);
     Wire.endTransmission(true);
     
-    // Configure gyroscope (±250°/s)
     Wire.beginTransmission(MPU6050_ADDR);
-    Wire.write(0x1B);  // GYRO_CONFIG register
-    Wire.write(0);     // ±250°/s
+    Wire.write(0x1B);
+    Wire.write(0);
     Wire.endTransmission(true);
     
-    // Calibrate gyro offset
     Serial.println("Calibrating MPU6050... Keep robot still!");
     delay(1000);
     
@@ -410,12 +364,12 @@ void initMPU6050() {
 
 float readRawGyroZ() {
     Wire.beginTransmission(MPU6050_ADDR);
-    Wire.write(0x47);  // GYRO_ZOUT_H register
+    Wire.write(0x47);
     Wire.endTransmission(false);
     Wire.requestFrom(MPU6050_ADDR, 2, true);
     
     int16_t raw = (Wire.read() << 8) | Wire.read();
-    return raw / 131.0;  // Convert to °/s (±250°/s range)
+    return raw / 131.0;
 }
 
 void updateYaw() {
@@ -425,13 +379,10 @@ void updateYaw() {
     
     float gyroZ = readRawGyroZ() - gyroZOffset;
     
-    // Integrate gyro to get yaw
-    // Only update if rotation is significant (reduce drift)
     if (abs(gyroZ) > 0.5) {
         currentYaw += gyroZ * dt;
     }
     
-    // Normalize to 0-360
     while (currentYaw < 0) currentYaw += 360;
     while (currentYaw >= 360) currentYaw -= 360;
 }
@@ -442,7 +393,6 @@ float readMPU6050Yaw() {
 }
 
 void calibrateMPU6050Heading() {
-    // Reset yaw to 0 (current direction becomes "north")
     currentYaw = 0;
     lastMPUUpdate = millis();
 }
@@ -454,21 +404,15 @@ void turnRight90() {
     
     Serial.printf("Turning right: %.1f -> %.1f\n", startYaw, targetYaw);
     
-    // Turn right
     turnRightInPlace();
     
-    // Wait until target reached
     while (true) {
         updateYaw();
         float error = targetYaw - currentYaw;
-        
-        // Normalize error
         while (error > 180) error -= 360;
         while (error < -180) error += 360;
         
-        if (abs(error) < TURN_TOLERANCE) {
-            break;
-        }
+        if (abs(error) < TURN_TOLERANCE) break;
         delay(10);
     }
     
@@ -484,21 +428,15 @@ void turnLeft90() {
     
     Serial.printf("Turning left: %.1f -> %.1f\n", startYaw, targetYaw);
     
-    // Turn left
     turnLeftInPlace();
     
-    // Wait until target reached
     while (true) {
         updateYaw();
         float error = targetYaw - currentYaw;
-        
-        // Normalize error
         while (error > 180) error -= 360;
         while (error < -180) error += 360;
         
-        if (abs(error) < TURN_TOLERANCE) {
-            break;
-        }
+        if (abs(error) < TURN_TOLERANCE) break;
         delay(10);
     }
     
@@ -533,7 +471,6 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             clientConnected = true;
             break;
         case WStype_TEXT:
-            // Handle commands from visualizer if needed
             break;
     }
 }
@@ -542,21 +479,27 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\n=== Maze Solver Bot v1.0 ===");
+    Serial.println("\n=== Maze Solver Bot v1.0 (L298N) ===");
     
-    // Initialize components
     initSensors();
     initMotors();
     initMPU6050();
     
-    // Line sensor interrupt
     pinMode(LINE_SENSOR_PIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(LINE_SENSOR_PIN), onLineCrossed, FALLING);
     
-    // Initialize Q-table
     initQLearning();
     
-    // Connect to WiFi
+    // Static IP configuration for POCO hotspot
+    IPAddress local_IP(192, 168, 43, 100);   // ESP32's static IP
+    IPAddress gateway(192, 168, 43, 1);      // Hotspot gateway (usually .1)
+    IPAddress subnet(255, 255, 255, 0);
+    IPAddress dns(8, 8, 8, 8);               // Google DNS
+    
+    if (!WiFi.config(local_IP, gateway, subnet, dns)) {
+        Serial.println("Static IP configuration failed!");
+    }
+    
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     Serial.print("Connecting to WiFi");
     while (WiFi.status() != WL_CONNECTED) {
@@ -564,17 +507,15 @@ void setup() {
         Serial.print(".");
     }
     Serial.println();
-    Serial.print("Connected! IP: ");
+    Serial.print("Connected with static IP: ");
     Serial.println(WiFi.localIP());
     
-    // Start WebSocket server
     webSocket.begin();
     webSocket.onEvent(webSocketEvent);
     Serial.println("WebSocket server started on port 81");
     
-    // Ready to start
     robotState = STATE_CALIBRATING;
-    Serial.println("Robot ready! Place on START marker and press boot button to begin.");
+    Serial.println("Robot ready! Place on START and press boot button.");
 }
 
 // ======================= MAIN LOOP =======================
@@ -584,13 +525,11 @@ void loop() {
     
     switch (robotState) {
         case STATE_IDLE:
-            // Waiting for command
             break;
             
         case STATE_CALIBRATING:
-            // Wait for button press to start
-            if (digitalRead(0) == LOW) {  // Boot button pressed
-                delay(200);  // Debounce
+            if (digitalRead(0) == LOW) { // Boot button
+                delay(200);
                 Serial.println("Starting maze exploration...");
                 episode = 1;
                 resetEpisode();
@@ -603,22 +542,16 @@ void loop() {
             break;
             
         case STATE_AT_GOAL:
-            // Episode complete - goal reached!
             Serial.printf("Episode %d complete! Steps: %d, Reward: %.1f\n", 
                           episode, stepCount, totalReward);
             sendEpisodeComplete();
-            
-            // Prepare for next episode
             delay(2000);
             episode++;
             epsilon = max(epsilonMin, epsilon * epsilonDecay);
-            
-            // Return to start (manual or automated)
             robotState = STATE_RETURNING;
             break;
             
         case STATE_RETURNING:
-            // For now, wait for manual reset
             Serial.println("Place robot back at START and press boot button");
             while (digitalRead(0) != LOW) {
                 webSocket.loop();
@@ -634,7 +567,6 @@ void loop() {
 // ======================= Q-LEARNING IMPLEMENTATION =======================
 
 void initQLearning() {
-    // Initialize Q-table with zeros
     for (int s = 0; s < NUM_STATES; s++) {
         for (int a = 0; a < NUM_ACTIONS; a++) {
             Q[s][a] = 0.0;
@@ -644,10 +576,8 @@ void initQLearning() {
 }
 
 void qLearningStep() {
-    // Get current state
     int state = getState();
     
-    // Read walls at current position
     bool walls[4];
     walls[NORTH] = (heading == NORTH) ? isFrontWall() : 
                    (heading == EAST) ? isLeftWall() :
@@ -662,10 +592,7 @@ void qLearningStep() {
                   (heading == NORTH) ? isLeftWall() :
                   (heading == EAST) ? !isFrontWall() : isRightWall();
     
-    // Select action using ε-greedy policy
     int action = selectAction(state);
-    
-    // Check if action is valid (no wall in that direction)
     int attempts = 0;
     while (walls[action] && attempts < 4) {
         action = (action + 1) % 4;
@@ -673,17 +600,14 @@ void qLearningStep() {
     }
     
     if (attempts >= 4) {
-        // Dead end - all directions blocked
         Serial.println("Dead end!");
         totalReward -= 50;
         robotState = STATE_RETURNING;
         return;
     }
     
-    // Execute the action
     executeAction(action);
     
-    // Wait for cell transition
     cellCrossed = false;
     unsigned long startTime = millis();
     while (!cellCrossed && (millis() - startTime < 5000)) {
@@ -692,37 +616,26 @@ void qLearningStep() {
     }
     stopMotors();
     
-    // Check line markers
     checkMarkers();
     
-    // Get reward and new state
     float reward = getReward();
     totalReward += reward;
     int nextState = getState();
     
-    // Update Q-value
     updateQValue(state, action, nextState, reward);
     
-    // Send telemetry
     stepCount++;
     sendTelemetry();
     
-    // Small delay for stability
     delay(200);
     
-    // Check if goal reached
-    if (isAtGoal) {
-        robotState = STATE_AT_GOAL;
-    }
+    if (isAtGoal) robotState = STATE_AT_GOAL;
 }
 
 int selectAction(int state) {
-    // ε-greedy action selection
     if (random(100) < epsilon * 100) {
-        // Random action (exploration)
         return random(4);
     } else {
-        // Best action from Q-table (exploitation)
         int bestAction = 0;
         float bestValue = Q[state][0];
         for (int a = 1; a < NUM_ACTIONS; a++) {
@@ -736,52 +649,33 @@ int selectAction(int state) {
 }
 
 void executeAction(int action) {
-    // Calculate turn needed
     int turnAmount = (action - heading + 4) % 4;
     
-    if (turnAmount == 1) {
-        // Turn right 90°
-        turnRight90();
-    } else if (turnAmount == 2) {
-        // Turn around 180°
-        turnRight90();
-        turnRight90();
-    } else if (turnAmount == 3) {
-        // Turn left 90°
-        turnLeft90();
-    }
-    // turnAmount == 0 means already facing correct direction
+    if (turnAmount == 1) turnRight90();
+    else if (turnAmount == 2) { turnRight90(); turnRight90(); }
+    else if (turnAmount == 3) turnLeft90();
     
     heading = action;
 }
 
 float getReward() {
-    if (isAtGoal) {
-        return 100.0;  // Big reward for goal
-    }
-    if (isFrontWall() && readFrontDistance() < 5) {
-        return -10.0;  // Punishment for hitting wall
-    }
-    return -1.0;  // Small step penalty
+    if (isAtGoal) return 100.0;
+    if (isFrontWall() && readFrontDistance() < 5) return -10.0;
+    return -1.0;
 }
 
 void updateQValue(int state, int action, int nextState, float reward) {
-    // Find max Q-value for next state
     float maxNextQ = Q[nextState][0];
     for (int a = 1; a < NUM_ACTIONS; a++) {
         if (Q[nextState][a] > maxNextQ) {
             maxNextQ = Q[nextState][a];
         }
     }
-    
-    // Q-learning update rule
     Q[state][action] += alpha * (reward + gamma_rl * maxNextQ - Q[state][action]);
 }
 
 int getState() {
-    // Convert (x, y) to state index
-    // Handle negative positions by offsetting
-    int x = currentX + MAZE_SIZE;  // Offset to handle negatives
+    int x = currentX + MAZE_SIZE;
     int y = currentY + MAZE_SIZE;
     return (y % MAZE_SIZE) * MAZE_SIZE + (x % MAZE_SIZE);
 }
@@ -796,66 +690,42 @@ void updatePositionBasedOnHeading() {
 }
 
 void checkMarkers() {
-    delay(100);  // Wait for line count to settle
-    
-    if (lineCount == 1) {
-        // Single line = cell boundary
-        updatePositionBasedOnHeading();
-    } else if (lineCount == 2) {
-        // Double line = START
-        currentX = 0;
-        currentY = 0;
-        isAtStart = true;
+    delay(100);
+    if (lineCount == 1) updatePositionBasedOnHeading();
+    else if (lineCount == 2) {
+        currentX = 0; currentY = 0; isAtStart = true;
         Serial.println("START marker detected!");
     } else if (lineCount >= 3) {
-        // Triple line = GOAL
         isAtGoal = true;
         Serial.println("GOAL reached!");
     }
-    
     lineCount = 0;
 }
 
 void resetEpisode() {
-    currentX = 0;
-    currentY = 0;
-    heading = NORTH;  // Assume starting facing north (into maze)
-    stepCount = 0;
-    totalReward = 0;
-    isAtGoal = false;
-    isAtStart = false;
-    lineCount = 0;
-    
-    // Lock initial heading from MPU6050
+    currentX = 0; currentY = 0;
+    heading = NORTH;
+    stepCount = 0; totalReward = 0;
+    isAtGoal = false; isAtStart = false; lineCount = 0;
     calibrateMPU6050Heading();
-    
     Serial.printf("Episode %d starting...\n", episode);
 }
 
-// ======================= TELEMETRY =======================
-
 void sendTelemetry() {
     if (!clientConnected) return;
-    
     StaticJsonDocument<256> doc;
     doc["type"] = "telemetry";
-    
     JsonObject pos = doc.createNestedObject("position");
-    pos["x"] = currentX;
-    pos["y"] = currentY;
-    
-    doc["heading"] = heading * 90;  // Convert to degrees
-    
+    pos["x"] = currentX; pos["y"] = currentY;
+    doc["heading"] = heading * 90;
     JsonObject walls = doc.createNestedObject("walls");
     walls["front"] = isFrontWall();
     walls["left"] = isLeftWall();
     walls["right"] = isRightWall();
-    
     doc["episode"] = episode;
     doc["step"] = stepCount;
     doc["reward"] = totalReward;
     doc["isGoal"] = isAtGoal;
-    
     String json;
     serializeJson(doc, json);
     webSocket.broadcastTXT(json);
@@ -863,14 +733,12 @@ void sendTelemetry() {
 
 void sendEpisodeComplete() {
     if (!clientConnected) return;
-    
     StaticJsonDocument<128> doc;
     doc["type"] = "episode_complete";
     doc["episode"] = episode;
     doc["totalSteps"] = stepCount;
     doc["totalReward"] = totalReward;
     doc["solved"] = isAtGoal;
-    
     String json;
     serializeJson(doc, json);
     webSocket.broadcastTXT(json);

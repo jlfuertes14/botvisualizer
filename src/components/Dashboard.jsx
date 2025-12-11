@@ -15,7 +15,7 @@ export function Dashboard({
     onDisconnect,
     onDemoData
 }) {
-    const [ipAddress, setIpAddress] = useState('192.168.1.100');
+    const [ipAddress, setIpAddress] = useState('192.168.43.100');
     const [port, setPort] = useState('81');
     const [isDemoMode, setIsDemoMode] = useState(false);
     const demoIntervalRef = useRef(null);
@@ -105,7 +105,7 @@ export function Dashboard({
                     <div className="flex items-center gap-2">
                         <div className={`status-dot ${connectionStatus === 'demo' ? 'connected' : connectionStatus}`}></div>
                         <span className={`text-sm font-medium ${connectionStatus === 'connected' || connectionStatus === 'demo' ? 'text-cyber-green' :
-                                connectionStatus === 'connecting' ? 'text-yellow-400' : 'text-cyber-red'
+                            connectionStatus === 'connecting' ? 'text-yellow-400' : 'text-cyber-red'
                             }`}>
                             {connectionStatus === 'demo' ? 'Demo Mode' :
                                 connectionStatus === 'connected' ? 'Connected' :
@@ -128,7 +128,7 @@ export function Dashboard({
                             type="text"
                             value={ipAddress}
                             onChange={(e) => setIpAddress(e.target.value)}
-                            placeholder="192.168.1.100"
+                            placeholder="192.168.43.100"
                             className="w-full"
                             disabled={isConnected || isConnecting}
                         />
