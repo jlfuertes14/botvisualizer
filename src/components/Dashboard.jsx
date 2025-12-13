@@ -3,7 +3,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 /**
  * Dashboard Component
  * - Connection panel (IP input, connect/disconnect buttons)
- * - Sensor data display (yaw compass, direction indicator)
+ * - Sensor data display (yaw compass, ultrasonic sensors, wall detection)
  * - Demo mode button
  */
 export function Dashboard({
@@ -13,9 +13,12 @@ export function Dashboard({
     error,
     onConnect,
     onDisconnect,
-    onDemoData
+    onDemoData,
+    onStartMaze,
+    onStopMaze,
+    mazeConfig
 }) {
-    const [ipAddress, setIpAddress] = useState('YOUR-APP.up.railway.app');  // Update after deploying
+    const [ipAddress, setIpAddress] = useState('botvisualizer-production.up.railway.app');
     const [port, setPort] = useState('443');
     const [isDemoMode, setIsDemoMode] = useState(false);
     const demoIntervalRef = useRef(null);
@@ -180,39 +183,79 @@ export function Dashboard({
             <div className="glass-card p-4">
                 <h3 className="text-sm text-slate-400 mb-3 text-center">Yaw / Heading</h3>
                 <div className="flex flex-col items-center">
-                    <CompassDisplay yaw={sensorData.yaw} />
+                    <CompassDisplay yaw={sensorData.yaw || 0} />
                     <div className="mt-3 text-2xl font-bold text-cyber-cyan">
-                        {sensorData.yaw.toFixed(1)}°
+                        {(sensorData.yaw || 0).toFixed(1)}°
                     </div>
                 </div>
             </div>
 
-            {/* Direction Display Card */}
+            {/* Ultrasonic Sensors Card */}
             <div className="glass-card p-4">
-                <h3 className="text-sm text-slate-400 mb-3 text-center">Direction</h3>
-                <DirectionDisplay direction={sensorData.direction} />
-            </div>
-
-            {/* Data Stream Card */}
-            <div className="glass-card p-4">
-                <h3 className="text-sm text-slate-400 mb-3">Live Data</h3>
-                <div className="font-mono text-xs bg-slate-900/50 rounded p-2 overflow-x-auto">
-                    <pre className="text-cyber-cyan">
-                        {JSON.stringify({
-                            yaw: sensorData.yaw.toFixed(2),
-                            direction: sensorData.direction,
-                            timestamp: new Date(sensorData.timestamp).toLocaleTimeString(),
-                        }, null, 2)}
-                    </pre>
+                <h3 className="text-sm text-slate-400 mb-3 text-center">Ultrasonic Sensors</h3>
+                <div className="space-y-3">
+                    <SensorBar label="Front" value={sensorData.front} hasWall={sensorData.wallFront} />
+                    <SensorBar label="Left" value={sensorData.left} hasWall={sensorData.wallLeft} />
+                    <SensorBar label="Right" value={sensorData.right} hasWall={sensorData.wallRight} />
                 </div>
             </div>
 
-            {/* ESP32 Code Reference */}
-            <div className="glass-card p-4 text-sm">
-                <h3 className="text-slate-400 mb-2">ESP32 Data Format</h3>
-                <code className="text-xs text-cyber-purple block bg-slate-900/50 p-2 rounded">
-                    {`{"yaw": 45.0, "direction": "forward"}`}
-                </code>
+            {/* Robot State Card */}
+            <div className="glass-card p-4">
+                <h3 className="text-sm text-slate-400 mb-3 text-center">Robot State</h3>
+                <div className="flex flex-col items-center">
+                    <RobotStateDisplay state={sensorData.state} />
+                    <div className="mt-3 text-sm text-slate-300">
+                        Position: ({sensorData.x ?? '-'}, {sensorData.y ?? '-'})
+                    </div>
+                    <div className="text-xs text-slate-500">
+                        Heading: {['N', 'E', 'S', 'W'][sensorData.heading] || '-'}
+                    </div>
+                </div>
+            </div>
+
+            {/* Maze Control Card */}
+            <div className="glass-card p-4">
+                <h3 className="text-sm text-slate-400 mb-3 text-center">Maze Control</h3>
+                <div className="space-y-2">
+                    <button
+                        onClick={onStartMaze}
+                        className="cyber-btn w-full"
+                        disabled={!isConnected || sensorData.state === 'moving' || sensorData.state === 'thinking'}
+                    >
+                        🚀 Start Maze
+                    </button>
+                    <button
+                        onClick={onStopMaze}
+                        className="cyber-btn disconnect w-full"
+                        disabled={!isConnected || sensorData.state === 'idle'}
+                    >
+                        ⏹ Stop
+                    </button>
+                </div>
+                {mazeConfig && (
+                    <div className="mt-3 text-xs text-slate-500">
+                        <div>Start: ({mazeConfig.start?.x}, {mazeConfig.start?.y})</div>
+                        <div>Goal: ({mazeConfig.goal?.x}, {mazeConfig.goal?.y})</div>
+                    </div>
+                )}
+            </div>
+
+            {/* Live Data Stream Card */}
+            <div className="glass-card p-4">
+                <h3 className="text-sm text-slate-400 mb-3">Live Sensor Data</h3>
+                <div className="font-mono text-xs bg-slate-900/50 rounded p-2 overflow-x-auto max-h-32">
+                    <pre className="text-cyber-cyan">
+                        {JSON.stringify({
+                            front: sensorData.front?.toFixed(1) + 'cm',
+                            left: sensorData.left?.toFixed(1) + 'cm',
+                            right: sensorData.right?.toFixed(1) + 'cm',
+                            yaw: (sensorData.yaw || 0).toFixed(1) + '°',
+                            state: sensorData.state,
+                            pos: `(${sensorData.x}, ${sensorData.y})`
+                        }, null, 2)}
+                    </pre>
+                </div>
             </div>
         </div>
     );
@@ -268,4 +311,58 @@ function DirectionDisplay({ direction }) {
     );
 }
 
+/**
+ * Ultrasonic sensor bar display
+ */
+function SensorBar({ label, value, hasWall }) {
+    const distance = value || 999;
+    const maxDistance = 50; // cm for visual scale
+    const percentage = Math.min((distance / maxDistance) * 100, 100);
+
+    // Color based on distance
+    const getBarColor = () => {
+        if (hasWall || distance < 15) return 'bg-cyber-red';
+        if (distance < 25) return 'bg-yellow-500';
+        return 'bg-cyber-green';
+    };
+
+    return (
+        <div className="flex items-center gap-2">
+            <span className="text-xs text-slate-400 w-12">{label}</span>
+            <div className="flex-1 h-3 bg-slate-800 rounded overflow-hidden">
+                <div
+                    className={`h-full transition-all duration-200 ${getBarColor()}`}
+                    style={{ width: `${100 - percentage}%` }}
+                />
+            </div>
+            <span className={`text-xs font-mono w-14 text-right ${hasWall ? 'text-cyber-red' : 'text-slate-300'}`}>
+                {distance < 999 ? `${distance.toFixed(1)}cm` : '---'}
+            </span>
+            {hasWall && <span className="text-cyber-red text-xs">⚠</span>}
+        </div>
+    );
+}
+
+/**
+ * Robot state display with icons
+ */
+function RobotStateDisplay({ state }) {
+    const stateConfig = {
+        idle: { icon: '💤', label: 'Idle', color: 'text-slate-400', bg: 'bg-slate-800/50' },
+        thinking: { icon: '🤔', label: 'Thinking', color: 'text-yellow-400', bg: 'bg-yellow-900/30' },
+        moving: { icon: '🏃', label: 'Moving', color: 'text-cyber-cyan', bg: 'bg-cyan-900/30' },
+        goal: { icon: '🎉', label: 'Goal!', color: 'text-cyber-green', bg: 'bg-green-900/30' },
+    };
+
+    const config = stateConfig[state] || stateConfig.idle;
+
+    return (
+        <div className={`flex items-center gap-2 px-4 py-2 rounded-lg ${config.bg}`}>
+            <span className="text-2xl">{config.icon}</span>
+            <span className={`font-medium ${config.color}`}>{config.label}</span>
+        </div>
+    );
+}
+
 export default Dashboard;
+

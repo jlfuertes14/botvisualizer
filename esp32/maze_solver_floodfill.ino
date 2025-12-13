@@ -1,8 +1,10 @@
 /*
- * Maze Solver Bot - Final Version (Optimistic Q-Learning + Re-Run Proof)
+ * Maze Solver Bot - Flood Fill Version
  * Logic:
- * 1. "Discovery Run": Robot assumes empty map. Moves, detects walls, updates map, re-plans in RAM.
- * 2. "Proof Run": Press Boot Button at goal. Robot resets position but KEEPS memory.
+ * 1. "Discovery Run": Robot explores, detects walls, updates map, uses Flood Fill for optimal path.
+ * 2. "Speed Run": Press Boot Button at goal. Robot resets position but KEEPS wall memory.
+ * 
+ * Flood Fill is deterministic and always finds the shortest path!
  */
 
 #include <WiFi.h>
@@ -11,9 +13,9 @@
 #include <ArduinoJson.h>
 #include <EEPROM.h>
 
-// EEPROM Layout: [Magic(4)] [MapData(25)] = 29 bytes
-#define EEPROM_SIZE 64
-#define EEPROM_MAGIC 0x4D415A45  // "MAZE" in hex
+// EEPROM Layout: [Magic(4)] [WallData(MAZE_SIZE*MAZE_SIZE*4 bytes for walls)]
+#define EEPROM_SIZE 128
+#define EEPROM_MAGIC 0x464C4F44  // "FLOD" in hex
 
 // ======================= CONFIGURATION =======================
 
@@ -33,7 +35,7 @@ const char* WS_SERVER_HOST = "botvisualizer-production.up.railway.app";
 
 // TCRT5000 Line Sensor
 #define LINE_SENSOR_PIN 4
-#define LINE_THRESHOLD 2048 // Adjust based on your black tape readings
+#define LINE_THRESHOLD 1500
 
 // L298N Motor Driver
 #define MOTOR_IN1 19
@@ -48,43 +50,19 @@ const char* WS_SERVER_HOST = "botvisualizer-production.up.railway.app";
 #define MPU6050_SCL 33
 #define MPU6050_ADDR 0x68
 
-#define STATUS_LED 2 // Onboard LED
+#define STATUS_LED 2
 
 // ======================= TUNING CONSTANTS =======================
 
-// Motor Physics
-#define BASE_SPEED 180       // High cruising speed to prevent stalling
-#define TURN_SPEED 200       // High torque for turns
-#define KICK_TIME 40         // Milliseconds of FULL POWER (255) at start
-#define PWM_FREQ 5000
-#define PWM_RESOLUTION 8
+#define BASE_SPEED 120
+#define TURN_SPEED 140
+#define KICK_TIME 40
 
-// Navigation
 #define MAZE_SIZE 5
-#define MAX_CELL_TIME 2000   // Timeout if line not found (ms)
-#define WALL_DIST_CM 15.0    // Distance to mark a grid cell as "Wall"
+#define MAX_CELL_TIME 2000
+#define WALL_DIST_CM 7.0
 
-// Q-Learning Hyperparameters
-#define NUM_STATES (MAZE_SIZE * MAZE_SIZE)
-#define NUM_ACTIONS 4 
-float Q[NUM_STATES][NUM_ACTIONS];
-float alpha = 0.5;    // High learning rate (learn immediately)
-float gamma_rl = 0.9; // Future reward importance
 
-// Adaptive Training - reduce episodes when map is stable
-#define MAX_VIRTUAL_EPISODES 2000
-#define MIN_VIRTUAL_EPISODES 500
-int virtualEpisodeCount = MAX_VIRTUAL_EPISODES;
-bool mapChangedThisStep = false;
-
-// Wall-Following PID Constants
-#define PID_KP 3.0
-#define PID_KI 0.0
-#define PID_KD 1.0
-#define WALL_FOLLOW_DIST 8.0  // Target distance from wall (cm)
-#define WALL_PRESENT_DIST 20.0  // Distance to consider wall present
-float pidLastError = 0;
-float pidIntegral = 0;
 
 // ======================= GLOBAL VARIABLES =======================
 
@@ -94,10 +72,17 @@ int GOAL_X = 4;
 int GOAL_Y = 4;
 int heading = 0; // 0=NORTH, 1=EAST, 2=SOUTH, 3=WEST
 
-// THE MEMORY MAP (0=Empty, 1=Wall)
-int internalMap[MAZE_SIZE][MAZE_SIZE] = {0}; 
-
 enum { NORTH = 0, EAST = 1, SOUTH = 2, WEST = 3 };
+
+// Flood Fill distance values
+int floodMap[MAZE_SIZE][MAZE_SIZE];
+
+// Wall data: for each cell, store walls in 4 directions
+// Bit 0 = North wall, Bit 1 = East wall, Bit 2 = South wall, Bit 3 = West wall
+uint8_t wallMap[MAZE_SIZE][MAZE_SIZE];
+
+// Track which cells have been visited
+bool visited[MAZE_SIZE][MAZE_SIZE];
 
 enum RobotState { 
   STATE_IDLE, 
@@ -107,7 +92,6 @@ enum RobotState {
 };
 RobotState robotState = STATE_IDLE;
 
-// Line Detection Interrupt Vars
 volatile bool cellCrossed = false;
 volatile unsigned long lastPulse = 0;
 
@@ -116,23 +100,23 @@ float gyroZOffset = 0;
 float currentYaw = 0;
 unsigned long lastMPUUpdate = 0;
 
-// Sensor telemetry interval
 unsigned long lastSensorUpdate = 0;
-#define SENSOR_UPDATE_INTERVAL 50 // Send sensor data every 50ms (20Hz)
+#define SENSOR_UPDATE_INTERVAL 50
 
 // ======================= FUNCTION DECLARATIONS =======================
 void initMotors();
 void setMotors(int L, int R);
 void stopMotors();
-void kickStartAndDriveOneCell();
-void driveWithPID();
+void driveOneCell();
+void driveForward();
 void turnRight90();
 void turnLeft90();
 float readDistance(int trig, int echo);
 void initMPU6050();
 void updateYaw();
-void trainQTable();
-void updateMapAndPlan();
+void floodFill();
+void updateWalls();
+int getBestDirection();
 void executeNextStep();
 void sendTelemetry();
 void sendSensorData();
@@ -145,9 +129,8 @@ void IRAM_ATTR onLineCrossed();
 void setup() {
     Serial.begin(115200);
     pinMode(STATUS_LED, OUTPUT);
-    pinMode(0, INPUT_PULLUP); // Boot Button for Re-Run
+    pinMode(0, INPUT_PULLUP);
     
-    // Initialize EEPROM and load saved map
     EEPROM.begin(EEPROM_SIZE);
     loadMapFromEEPROM();
     
@@ -155,18 +138,16 @@ void setup() {
     initMotors();
     initMPU6050();
 
-    // WiFi
     Serial.print("Connecting to WiFi");
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
     Serial.println(" Connected!");
 
-    // WebSocket
     webSocket.beginSSL(WS_SERVER_HOST, 443, "/");
     webSocket.onEvent(webSocketEvent);
     webSocket.setReconnectInterval(5000);
     
-    Serial.println("READY. Waiting for Start...");
+    Serial.println("FLOOD FILL Maze Solver Ready. Waiting for Start...");
 }
 
 void initSensors() {
@@ -182,7 +163,6 @@ void initSensors() {
 void loop() {
     webSocket.loop();
     
-    // Periodically send sensor data to website (regardless of state)
     if (millis() - lastSensorUpdate > SENSOR_UPDATE_INTERVAL) {
         sendSensorData();
         lastSensorUpdate = millis();
@@ -190,19 +170,21 @@ void loop() {
     
     switch (robotState) {
         case STATE_IDLE:
-            // Blink slowly waiting for start
             if (millis() % 1000 < 500) digitalWrite(STATUS_LED, HIGH);
             else digitalWrite(STATUS_LED, LOW);
             break;
             
         case STATE_THINKING:
             stopMotors();
-            digitalWrite(STATUS_LED, HIGH); // LED ON = Processing
+            digitalWrite(STATUS_LED, HIGH);
             
-            // 1. Read Sensors & Update Map
-            updateMapAndPlan();
+            // 1. Update walls from sensors
+            updateWalls();
             
-            // 2. Transition to Moving
+            // 2. Recalculate flood fill
+            floodFill();
+            
+            // 3. Transition to Moving
             robotState = STATE_MOVING;
             digitalWrite(STATUS_LED, LOW); 
             break;
@@ -212,40 +194,103 @@ void loop() {
             
             if (currentX == GOAL_X && currentY == GOAL_Y) {
                 robotState = STATE_AT_GOAL;
+                saveMapToEEPROM();  // Save learned walls
+                Serial.println("GOAL REACHED! Map saved to EEPROM.");
                 sendTelemetry(); 
             } else {
-                robotState = STATE_THINKING; // Check sensors at next cell
+                robotState = STATE_THINKING;
             }
             break;
             
         case STATE_AT_GOAL:
             stopMotors();
-            // Fast celebrate blink
             if (millis() % 300 < 150) digitalWrite(STATUS_LED, HIGH);
             else digitalWrite(STATUS_LED, LOW);
             
-            // === RE-RUN LOGIC ===
-            if (digitalRead(0) == LOW) { // Boot Button Pressed
-                Serial.println("RE-RUN: Resetting Position (Keeping Memory)");
+            // RE-RUN: Press Boot Button
+            if (digitalRead(0) == LOW) {
+                Serial.println("SPEED RUN: Starting with known map!");
                 
                 currentX = 0; 
                 currentY = 0;
-                heading = NORTH; // PLACE ROBOT FACING NORTH!
+                heading = NORTH;
                 
-                // Retrain once to generate full path from start
-                trainQTable();
+                // Reset visited but KEEP wallMap
+                memset(visited, false, sizeof(visited));
+                floodFill();  // Recalculate from start
                 
-                delay(1000); // Wait for hand removal
+                delay(1000);
                 robotState = STATE_THINKING;
             }
             break;
     }
 }
 
-// ======================= OPTIMISTIC Q-LEARNING CORE =======================
+// ======================= FLOOD FILL ALGORITHM =======================
 
-void updateMapAndPlan() {
-    // 1. READ SENSORS
+void floodFill() {
+    // Initialize all cells to max distance
+    for (int y = 0; y < MAZE_SIZE; y++) {
+        for (int x = 0; x < MAZE_SIZE; x++) {
+            floodMap[y][x] = 255;
+        }
+    }
+    
+    // Goal cell has distance 0
+    floodMap[GOAL_Y][GOAL_X] = 0;
+    
+    // BFS to fill distances
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        
+        for (int y = 0; y < MAZE_SIZE; y++) {
+            for (int x = 0; x < MAZE_SIZE; x++) {
+                if (floodMap[y][x] == 255) continue;
+                
+                int currentDist = floodMap[y][x];
+                
+                // Check all 4 neighbors
+                // North (y-1)
+                if (y > 0 && !(wallMap[y][x] & (1 << NORTH))) {
+                    if (floodMap[y-1][x] > currentDist + 1) {
+                        floodMap[y-1][x] = currentDist + 1;
+                        changed = true;
+                    }
+                }
+                // South (y+1)
+                if (y < MAZE_SIZE-1 && !(wallMap[y][x] & (1 << SOUTH))) {
+                    if (floodMap[y+1][x] > currentDist + 1) {
+                        floodMap[y+1][x] = currentDist + 1;
+                        changed = true;
+                    }
+                }
+                // East (x+1)
+                if (x < MAZE_SIZE-1 && !(wallMap[y][x] & (1 << EAST))) {
+                    if (floodMap[y][x+1] > currentDist + 1) {
+                        floodMap[y][x+1] = currentDist + 1;
+                        changed = true;
+                    }
+                }
+                // West (x-1)
+                if (x > 0 && !(wallMap[y][x] & (1 << WEST))) {
+                    if (floodMap[y][x-1] > currentDist + 1) {
+                        floodMap[y][x-1] = currentDist + 1;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    
+    Serial.printf("Flood Fill complete. Current cell distance: %d\n", floodMap[currentY][currentX]);
+}
+
+void updateWalls() {
+    // Mark current cell as visited
+    visited[currentY][currentX] = true;
+    
+    // Read sensors
     float distFront = readDistance(FRONT_TRIG_PIN, FRONT_ECHO_PIN);
     float distLeft = readDistance(LEFT_TRIG_PIN, LEFT_ECHO_PIN);
     float distRight = readDistance(RIGHT_TRIG_PIN, RIGHT_ECHO_PIN);
@@ -253,122 +298,118 @@ void updateMapAndPlan() {
     bool wallFront = (distFront < WALL_DIST_CM);
     bool wallLeft = (distLeft < WALL_DIST_CM);
     bool wallRight = (distRight < WALL_DIST_CM);
-
-    // 2. CALCULATE GRID COORDINATES OF NEIGHBORS
-    int fx = currentX, fy = currentY; 
-    int lx = currentX, ly = currentY; 
-    int rx = currentX, ry = currentY; 
     
-    if (heading == NORTH) { fy--; lx--; rx++; }
-    else if (heading == EAST) { fx++; ly--; ry++; }
-    else if (heading == SOUTH) { fy++; lx++; rx--; }
-    else if (heading == WEST) { fx--; ly++; ry--; }
-
-    bool mapChanged = false;
-
-    // 3. MARK WALLS IN MEMORY
-    auto markWall = [&](int x, int y) {
-        if (x >= 0 && x < MAZE_SIZE && y >= 0 && y < MAZE_SIZE) {
-            if (internalMap[y][x] == 0) {
-                internalMap[y][x] = 1; // Mark as Wall
-                mapChanged = true;
-            }
+    // Convert sensor readings to absolute directions based on heading
+    int frontDir = heading;
+    int leftDir = (heading + 3) % 4;  // WEST when facing NORTH
+    int rightDir = (heading + 1) % 4; // EAST when facing NORTH
+    
+    // Update wall map for current cell
+    if (wallFront) {
+        wallMap[currentY][currentX] |= (1 << frontDir);
+        // Also update neighbor's wall
+        int nx = currentX, ny = currentY;
+        if (frontDir == NORTH) ny--;
+        else if (frontDir == SOUTH) ny++;
+        else if (frontDir == EAST) nx++;
+        else if (frontDir == WEST) nx--;
+        if (nx >= 0 && nx < MAZE_SIZE && ny >= 0 && ny < MAZE_SIZE) {
+            wallMap[ny][nx] |= (1 << ((frontDir + 2) % 4));
         }
-    };
-
-    if (wallFront) markWall(fx, fy);
-    if (wallLeft) markWall(lx, ly);
-    if (wallRight) markWall(rx, ry);
-
-    // 4. UPDATE ADAPTIVE TRAINING PARAMETERS
-    mapChangedThisStep = mapChanged;
-    if (mapChanged) {
-        virtualEpisodeCount = MAX_VIRTUAL_EPISODES;  // Full training on new info
-        saveMapToEEPROM();  // Persist to EEPROM
-        Serial.println("Map updated and saved to EEPROM");
-    } else {
-        // Reduce training if map is stable
-        virtualEpisodeCount = max(MIN_VIRTUAL_EPISODES, virtualEpisodeCount - 100);
     }
-
-    // 5. RE-TRAIN Q-TABLE (Instant Virtual Learning)
-    trainQTable(); 
+    
+    if (wallLeft) {
+        wallMap[currentY][currentX] |= (1 << leftDir);
+        int nx = currentX, ny = currentY;
+        if (leftDir == NORTH) ny--;
+        else if (leftDir == SOUTH) ny++;
+        else if (leftDir == EAST) nx++;
+        else if (leftDir == WEST) nx--;
+        if (nx >= 0 && nx < MAZE_SIZE && ny >= 0 && ny < MAZE_SIZE) {
+            wallMap[ny][nx] |= (1 << ((leftDir + 2) % 4));
+        }
+    }
+    
+    if (wallRight) {
+        wallMap[currentY][currentX] |= (1 << rightDir);
+        int nx = currentX, ny = currentY;
+        if (rightDir == NORTH) ny--;
+        else if (rightDir == SOUTH) ny++;
+        else if (rightDir == EAST) nx++;
+        else if (rightDir == WEST) nx--;
+        if (nx >= 0 && nx < MAZE_SIZE && ny >= 0 && ny < MAZE_SIZE) {
+            wallMap[ny][nx] |= (1 << ((rightDir + 2) % 4));
+        }
+    }
+    
+    Serial.printf("Walls at (%d,%d): F=%d L=%d R=%d\n", currentX, currentY, wallFront, wallLeft, wallRight);
 }
 
-// Virtual Q-Learning (Runs in RAM with Adaptive Episode Count)
-void trainQTable() {
-    // Reset Q-table temporarily to avoid getting stuck in old loops
-    memset(Q, 0, sizeof(Q));
+int getBestDirection() {
+    int bestDir = -1;
+    int bestDist = floodMap[currentY][currentX];  // Must improve
     
-    unsigned long trainStart = millis();
+    // Check all 4 directions, prefer one that reduces distance
+    int dirs[] = {NORTH, EAST, SOUTH, WEST};
+    int dx[] = {0, 1, 0, -1};
+    int dy[] = {-1, 0, 1, 0};
     
-    // Run adaptive number of virtual episodes
-    for (int ep = 0; ep < virtualEpisodeCount; ep++) {
-        int vx = currentX, vy = currentY; // Start simulation from current spot
+    for (int i = 0; i < 4; i++) {
+        int dir = dirs[i];
+        int nx = currentX + dx[i];
+        int ny = currentY + dy[i];
         
-        for (int step = 0; step < 30; step++) { 
-            if (vx == GOAL_X && vy == GOAL_Y) break;
-            
-            int state = vy * MAZE_SIZE + vx;
-            
-            // Epsilon Greedy (Virtual)
-            int action;
-            if (random(100) < 10) action = random(4); 
-            else {
-                // Exploit Max Q
-                float maxQ = -9999;
-                action = 0;
-                for(int a=0; a<4; a++) if(Q[state][a] > maxQ) { maxQ = Q[state][a]; action = a; }
-            }
-            
-            // Virtual Move
-            int nx = vx, ny = vy;
-            if (action == NORTH) ny--;
-            else if (action == SOUTH) ny++;
-            else if (action == EAST) nx++;
-            else if (action == WEST) nx--;
-            
-            // Reward System
-            float reward = -1; 
-            float maxNextQ = 0;
-            
-            // Wall Check (Using Internal Map)
-            bool hitWall = false;
-            if (nx < 0 || nx >= MAZE_SIZE || ny < 0 || ny >= MAZE_SIZE) hitWall = true;
-            else if (internalMap[ny][nx] == 1) hitWall = true;
-            
-            if (hitWall) {
-                reward = -50; // Punishment
-                nx = vx; ny = vy; // Stay put
-            } else if (nx == GOAL_X && ny == GOAL_Y) {
-                reward = 100; // Goal
-            }
-            
-            // Bellman Update
-            int nextState = ny * MAZE_SIZE + nx;
-            for(int a=0; a<4; a++) if(Q[nextState][a] > maxNextQ) maxNextQ = Q[nextState][a];
-            Q[state][action] += alpha * (reward + gamma_rl * maxNextQ - Q[state][action]);
-            
-            vx = nx; vy = ny;
+        // Check bounds
+        if (nx < 0 || nx >= MAZE_SIZE || ny < 0 || ny >= MAZE_SIZE) continue;
+        
+        // Check wall
+        if (wallMap[currentY][currentX] & (1 << dir)) continue;
+        
+        // Check if this direction brings us closer to goal
+        if (floodMap[ny][nx] < bestDist) {
+            bestDist = floodMap[ny][nx];
+            bestDir = dir;
         }
     }
     
-    Serial.printf("Q-Table trained: %d episodes in %ldms\n", virtualEpisodeCount, millis() - trainStart);
+    // If no improving direction found, we're stuck or need to explore
+    if (bestDir == -1) {
+        Serial.println("WARNING: No improving path found!");
+        // Try any open direction
+        for (int i = 0; i < 4; i++) {
+            int dir = dirs[i];
+            if (!(wallMap[currentY][currentX] & (1 << dir))) {
+                int nx = currentX + dx[i];
+                int ny = currentY + dy[i];
+                if (nx >= 0 && nx < MAZE_SIZE && ny >= 0 && ny < MAZE_SIZE) {
+                    bestDir = dir;
+                    break;
+                }
+            }
+        }
+    }
+    
+    return bestDir;
 }
 
 // ======================= MOVEMENT & EXECUTION =======================
 
 void executeNextStep() {
-    int state = currentY * MAZE_SIZE + currentX;
+    int bestAction = getBestDirection();
     
-    // 1. Get Best Action
-    int bestAction = 0;
-    float maxQ = -9999;
-    for (int a = 0; a < 4; a++) {
-        if (Q[state][a] > maxQ) { maxQ = Q[state][a]; bestAction = a; }
+    if (bestAction == -1) {
+        Serial.println("ERROR: No valid move! Stopping.");
+        robotState = STATE_AT_GOAL;
+        return;
     }
     
-    // 2. Turn to Face Action
+    Serial.printf("Moving %s (flood dist: %d -> %d)\n", 
+        bestAction == NORTH ? "NORTH" : bestAction == EAST ? "EAST" : bestAction == SOUTH ? "SOUTH" : "WEST",
+        floodMap[currentY][currentX],
+        floodMap[currentY + (bestAction == SOUTH ? 1 : bestAction == NORTH ? -1 : 0)]
+                [currentX + (bestAction == EAST ? 1 : bestAction == WEST ? -1 : 0)]);
+    
+    // Turn to face action
     int turnDiff = (bestAction - heading + 4) % 4;
     
     if (turnDiff == 1) turnRight90();
@@ -376,12 +417,12 @@ void executeNextStep() {
     else if (turnDiff == 3) turnLeft90();
     
     heading = bestAction;
-    delay(200); // Stabilize before drive
+    delay(200);
 
-    // 3. Drive 1 Cell
-    kickStartAndDriveOneCell();
+    // Drive 1 Cell
+    driveOneCell();
     
-    // 4. Update Position
+    // Update Position
     if (heading == NORTH) currentY--;
     else if (heading == SOUTH) currentY++;
     else if (heading == EAST) currentX++;
@@ -390,66 +431,20 @@ void executeNextStep() {
     sendTelemetry();
 }
 
-void kickStartAndDriveOneCell() {
-    cellCrossed = false; // Reset interrupt flag
-    pidLastError = 0;
-    pidIntegral = 0;
-    
-    // PHASE 1: KICKSTART (Anti-Stall)
-    setMotors(255, 255);
-    delay(KICK_TIME);
-    
-    // PHASE 2: CRUISE WITH WALL-FOLLOWING PID UNTIL LINE OR TIMEOUT
+void driveOneCell() {
+    cellCrossed = false;
     unsigned long startTime = millis();
     
     while (!cellCrossed && (millis() - startTime < MAX_CELL_TIME)) {
-        driveWithPID();
-        delay(20);  // 50Hz control loop
+        driveForward();
+        delay(20);
     }
     
-    // PHASE 3: BRAKE
-    setMotors(-255, -255);
-    delay(50);
     stopMotors();
 }
 
-// Wall-Following PID for smoother driving
-void driveWithPID() {
-    float leftDist = readDistance(LEFT_TRIG_PIN, LEFT_ECHO_PIN);
-    float rightDist = readDistance(RIGHT_TRIG_PIN, RIGHT_ECHO_PIN);
-    
-    float error = 0;
-    
-    bool leftWall = (leftDist < WALL_PRESENT_DIST);
-    bool rightWall = (rightDist < WALL_PRESENT_DIST);
-    
-    if (leftWall && rightWall) {
-        // Both walls: center between them
-        error = leftDist - rightDist;
-    } else if (leftWall) {
-        // Only left wall: maintain distance from it
-        error = (leftDist - WALL_FOLLOW_DIST) * 2;
-    } else if (rightWall) {
-        // Only right wall: maintain distance from it
-        error = (WALL_FOLLOW_DIST - rightDist) * 2;
-    } else {
-        // No walls: drive straight
-        error = 0;
-    }
-    
-    // PID calculation
-    pidIntegral += error;
-    pidIntegral = constrain(pidIntegral, -50, 50);  // Anti-windup
-    float derivative = error - pidLastError;
-    pidLastError = error;
-    
-    float correction = (PID_KP * error) + (PID_KI * pidIntegral) + (PID_KD * derivative);
-    correction = constrain(correction, -60, 60);  // Limit correction
-    
-    int leftSpeed = BASE_SPEED - correction;
-    int rightSpeed = BASE_SPEED + correction;
-    
-    setMotors(constrain(leftSpeed, 100, 255), constrain(rightSpeed, 100, 255));
+void driveForward() {
+    setMotors(BASE_SPEED, BASE_SPEED);
 }
 
 // ======================= MOTOR & SENSOR HELPERS =======================
@@ -457,30 +452,26 @@ void driveWithPID() {
 void initMotors() {
     pinMode(MOTOR_IN1, OUTPUT); pinMode(MOTOR_IN2, OUTPUT);
     pinMode(MOTOR_IN3, OUTPUT); pinMode(MOTOR_IN4, OUTPUT);
-    
-    ledcAttach(MOTOR_ENA, PWM_FREQ, PWM_RESOLUTION);
-    ledcAttach(MOTOR_ENB, PWM_FREQ, PWM_RESOLUTION);
+    pinMode(MOTOR_ENA, OUTPUT);
+    pinMode(MOTOR_ENB, OUTPUT);
 }
 
 void setMotors(int L, int R) {
-    // Left
     if (L > 0) { digitalWrite(MOTOR_IN1, HIGH); digitalWrite(MOTOR_IN2, LOW); }
     else { digitalWrite(MOTOR_IN1, LOW); digitalWrite(MOTOR_IN2, HIGH); L = -L; }
-    ledcWrite(MOTOR_ENA, constrain(L, 0, 255));
+    analogWrite(MOTOR_ENA, constrain(L, 0, 255));
 
-    // Right
     if (R > 0) { digitalWrite(MOTOR_IN3, HIGH); digitalWrite(MOTOR_IN4, LOW); }
     else { digitalWrite(MOTOR_IN3, LOW); digitalWrite(MOTOR_IN4, HIGH); R = -R; }
-    ledcWrite(MOTOR_ENB, constrain(R, 0, 255));
+    analogWrite(MOTOR_ENB, constrain(R, 0, 255));
 }
 
 void stopMotors() { setMotors(0, 0); }
 
 void turnRight90() {
-    setMotors(255, -255); delay(KICK_TIME); // Kick
+    setMotors(255, -255); delay(KICK_TIME);
     setMotors(TURN_SPEED, -TURN_SPEED);
     
-    // Turn using IMU
     float startYaw = currentYaw;
     float target = startYaw + 90;
     if (target >= 360) target -= 360;
@@ -497,7 +488,7 @@ void turnRight90() {
 }
 
 void turnLeft90() {
-    setMotors(-255, 255); delay(KICK_TIME); // Kick
+    setMotors(-255, 255); delay(KICK_TIME);
     setMotors(-TURN_SPEED, TURN_SPEED);
     
     float startYaw = currentYaw;
@@ -519,16 +510,14 @@ float readDistance(int trig, int echo) {
     digitalWrite(trig, LOW); delayMicroseconds(2);
     digitalWrite(trig, HIGH); delayMicroseconds(10);
     digitalWrite(trig, LOW);
-    long dur = pulseIn(echo, HIGH, 5000); // 5ms timeout (~80cm)
+    long dur = pulseIn(echo, HIGH, 5000);
     if (dur == 0) return 999;
     return dur * 0.034 / 2;
 }
 
-// IMU Helpers
 void initMPU6050() {
     Wire.begin(MPU6050_SDA, MPU6050_SCL);
     Wire.beginTransmission(MPU6050_ADDR); Wire.write(0x6B); Wire.write(0); Wire.endTransmission(true);
-    // Calibration
     float sum = 0;
     for (int i=0; i<100; i++) {
         Wire.beginTransmission(MPU6050_ADDR); Wire.write(0x47); Wire.endTransmission(false);
@@ -554,7 +543,7 @@ void updateYaw() {
 
 void IRAM_ATTR onLineCrossed() {
     unsigned long now = millis();
-    if (now - lastPulse > 200) { // Debounce
+    if (now - lastPulse > 200) {
         cellCrossed = true;
         lastPulse = now;
     }
@@ -563,6 +552,7 @@ void IRAM_ATTR onLineCrossed() {
 void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     if (type == WStype_CONNECTED) {
         Serial.println("WebSocket connected");
+        
         // Identify as ESP32
         StaticJsonDocument<128> identifyDoc;
         identifyDoc["type"] = "identify";
@@ -570,29 +560,34 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
         String identifyJson;
         serializeJson(identifyDoc, identifyJson);
         webSocket.sendTXT(identifyJson);
+        
+        // Auto-start: Send start/goal config to visualizer
+        StaticJsonDocument<128> startDoc;
+        startDoc["type"] = "maze_config";
+        startDoc["start"]["x"] = currentX;
+        startDoc["start"]["y"] = currentY;
+        startDoc["goal"]["x"] = GOAL_X;
+        startDoc["goal"]["y"] = GOAL_Y;
+        startDoc["size"] = MAZE_SIZE;
+        String startJson;
+        serializeJson(startDoc, startJson);
+        webSocket.sendTXT(startJson);
+        
+        // Reset state and start solving
+        memset(wallMap, 0, sizeof(wallMap));
+        memset(visited, false, sizeof(visited));
+        heading = NORTH;
+        
+        Serial.printf("AUTO-START: (%d,%d) -> (%d,%d)\n", currentX, currentY, GOAL_X, GOAL_Y);
+        
+        floodFill();
+        robotState = STATE_THINKING;
     }
     else if (type == WStype_TEXT) {
         StaticJsonDocument<512> doc;
         deserializeJson(doc, payload);
         
-        if (doc["type"] == "start") {
-            // Reset map and state on "Start" command
-            memset(internalMap, 0, sizeof(internalMap));
-            
-            // Get start and goal positions from website
-            currentX = doc["start"]["x"];
-            currentY = doc["start"]["y"];
-            GOAL_X = doc["goal"]["x"];
-            GOAL_Y = doc["goal"]["y"];
-            
-            heading = NORTH; // Reset heading
-            
-            Serial.printf("START received: (%d,%d) -> (%d,%d)\n", currentX, currentY, GOAL_X, GOAL_Y);
-            
-            robotState = STATE_THINKING;
-        }
-        else if (doc["type"] == "stop") {
-            // Stop command from website
+        if (doc["type"] == "stop") {
             stopMotors();
             robotState = STATE_IDLE;
             Serial.println("STOP received");
@@ -612,18 +607,18 @@ void sendTelemetry() {
     doc["y"] = currentY;
     doc["heading"] = heading;
     
-    // Also include current state
     const char* stateNames[] = {"idle", "thinking", "moving", "goal"};
     doc["state"] = stateNames[robotState];
+    
+    // Include flood distance for debugging
+    doc["floodDist"] = floodMap[currentY][currentX];
     
     String json;
     serializeJson(doc, json);
     webSocket.sendTXT(json);
 }
 
-// Send sensor readings to website for display
 void sendSensorData() {
-    // Read all sensors
     float distFront = readDistance(FRONT_TRIG_PIN, FRONT_ECHO_PIN);
     float distLeft = readDistance(LEFT_TRIG_PIN, LEFT_ECHO_PIN);
     float distRight = readDistance(RIGHT_TRIG_PIN, RIGHT_ECHO_PIN);
@@ -633,24 +628,19 @@ void sendSensorData() {
     StaticJsonDocument<384> doc;
     doc["type"] = "sensors";
     
-    // Ultrasonic distances
     doc["front"] = distFront;
     doc["left"] = distLeft;
     doc["right"] = distRight;
     
-    // IMU data
     doc["yaw"] = currentYaw;
     
-    // Position and heading
     doc["x"] = currentX;
     doc["y"] = currentY;
     doc["heading"] = heading;
     
-    // Robot state
     const char* stateNames[] = {"idle", "thinking", "moving", "goal"};
     doc["state"] = stateNames[robotState];
     
-    // Wall detection
     doc["wallFront"] = (distFront < WALL_DIST_CM);
     doc["wallLeft"] = (distLeft < WALL_DIST_CM);
     doc["wallRight"] = (distRight < WALL_DIST_CM);
@@ -670,15 +660,15 @@ void saveMapToEEPROM() {
     EEPROM.put(addr, magic);
     addr += sizeof(magic);
     
-    // Write internal map (25 bytes for 5x5)
+    // Write wall map (25 bytes for 5x5)
     for (int y = 0; y < MAZE_SIZE; y++) {
         for (int x = 0; x < MAZE_SIZE; x++) {
-            EEPROM.write(addr++, (uint8_t)internalMap[y][x]);
+            EEPROM.write(addr++, wallMap[y][x]);
         }
     }
     
     EEPROM.commit();
-    Serial.printf("Map saved to EEPROM (%d bytes)\n", addr);
+    Serial.printf("Wall map saved to EEPROM (%d bytes)\n", addr);
 }
 
 void loadMapFromEEPROM() {
@@ -691,24 +681,19 @@ void loadMapFromEEPROM() {
     
     if (magic != EEPROM_MAGIC) {
         Serial.println("No valid map in EEPROM - starting fresh");
-        memset(internalMap, 0, sizeof(internalMap));
+        memset(wallMap, 0, sizeof(wallMap));
+        memset(visited, false, sizeof(visited));
         return;
     }
     
-    // Read internal map
+    // Read wall map
     int wallCount = 0;
     for (int y = 0; y < MAZE_SIZE; y++) {
         for (int x = 0; x < MAZE_SIZE; x++) {
-            internalMap[y][x] = EEPROM.read(addr++);
-            if (internalMap[y][x] == 1) wallCount++;
+            wallMap[y][x] = EEPROM.read(addr++);
+            if (wallMap[y][x] != 0) wallCount++;
         }
     }
     
-    Serial.printf("Map loaded from EEPROM (%d walls)\n", wallCount);
-    
-    // If map has data, reduce initial training
-    if (wallCount > 0) {
-        virtualEpisodeCount = MIN_VIRTUAL_EPISODES;
-        Serial.println("Using previous map knowledge - reduced training");
-    }
+    Serial.printf("Wall map loaded from EEPROM (%d cells with walls)\n", wallCount);
 }

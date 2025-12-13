@@ -23,6 +23,19 @@ function initEmptyMaze() {
   return maze;
 }
 
+// Action icons for movement display
+const getActionIcon = (action) => {
+  const icons = {
+    'forward': '⬆️',
+    'turn_left': '↰',
+    'turn_right': '↱',
+    'u_turn': '🔄',
+    'backward': '⬇️',
+    'run_start': '🚀',
+  };
+  return icons[action] || '•';
+};
+
 function App() {
   const {
     isConnected,
@@ -32,9 +45,17 @@ function App() {
     mazeData,
     discoveredWalls,
     pathHistory,
-    episodeHistory,
+    movementLog,
+    optimizedPath,
+    runHistory,
+    robotPathStatus,
     connect,
     disconnect,
+    sendCommand,
+    sendMazeStart,
+    sendStop,
+    sendOptimizedPath,
+    clearRobotPath,
     setSensorData,
     setMazeData,
     resetMazeData
@@ -58,6 +79,16 @@ function App() {
     // We update our lifted state accordingly
   }, []);
 
+  // Start maze with current configuration
+  const handleStartMaze = useCallback(() => {
+    sendMazeStart(startCell, goalCell);
+  }, [sendMazeStart, startCell, goalCell]);
+
+  // Stop the robot
+  const handleStopMaze = useCallback(() => {
+    sendStop();
+  }, [sendStop]);
+
   const connectionStatus = isConnected ? 'connected' :
     isConnecting ? 'connecting' : 'disconnected';
 
@@ -67,12 +98,16 @@ function App() {
       <Sidebar
         sensorData={sensorData}
         mazeData={mazeData}
-        episodeHistory={episodeHistory}
+        movementLog={movementLog}
+        optimizedPath={optimizedPath}
+        runHistory={runHistory}
+        robotPathStatus={robotPathStatus}
         isConnected={isConnected}
         isConnecting={isConnecting}
         error={error}
         onConnect={connect}
         onDisconnect={disconnect}
+        onSendCommand={sendCommand}
         onDemoData={setSensorData}
         onDemoMazeData={setMazeData}
         onResetMaze={resetMazeData}
@@ -90,6 +125,12 @@ function App() {
         onGoalCornerChange={setGoalCorner}
         onMazeWallsChange={setMazeWalls}
         onMazeChange={handleMazeChange}
+        // Maze control handlers
+        onStartMaze={handleStartMaze}
+        onStopMaze={handleStopMaze}
+        // Path saving handlers
+        onSendOptimizedPath={sendOptimizedPath}
+        onClearRobotPath={clearRobotPath}
       />
 
       {/* MAIN 3D VIEW */}
@@ -124,23 +165,23 @@ function App() {
           </div>
         </div>
 
-        {/* Episode Stats (Maze Mode) */}
+        {/* Run Stats (Maze Mode) - Replacing Episode Stats */}
         {mazeMode && mazeData && (
           <div className="absolute top-16 right-4 bg-slate-800/80 border border-slate-600 rounded-xl p-4 z-10 backdrop-blur-sm">
-            <div className="text-xs text-slate-400 uppercase tracking-wider mb-2">Episode Stats</div>
+            <div className="text-xs text-slate-400 uppercase tracking-wider mb-2">Run Stats</div>
             <div className="grid grid-cols-2 gap-3 text-sm">
               <div>
-                <div className="text-slate-500 text-xs">Episode</div>
-                <div className="text-cyan-400 font-bold">{mazeData.episode || 0}</div>
+                <div className="text-slate-500 text-xs">Run</div>
+                <div className="text-cyan-400 font-bold">{mazeData.run || 1}</div>
               </div>
               <div>
-                <div className="text-slate-500 text-xs">Steps</div>
-                <div className="text-white font-bold">{mazeData.step || 0}</div>
+                <div className="text-slate-500 text-xs">Moves</div>
+                <div className="text-white font-bold">{mazeData.move || 0}</div>
               </div>
               <div>
-                <div className="text-slate-500 text-xs">Reward</div>
-                <div className={`font-bold ${(mazeData.reward || 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                  {mazeData.reward?.toFixed(1) || 0}
+                <div className="text-slate-500 text-xs">Action</div>
+                <div className="text-purple-400 font-bold text-lg">
+                  {getActionIcon(mazeData.action)}
                 </div>
               </div>
               <div>
@@ -150,6 +191,17 @@ function App() {
                 </div>
               </div>
             </div>
+            {/* Path Optimization Mini-stats */}
+            {movementLog.length > 0 && (
+              <div className="mt-3 pt-3 border-t border-slate-700">
+                <div className="flex justify-between text-xs">
+                  <span className="text-slate-500">Raw → Optimized</span>
+                  <span className="text-emerald-400 font-mono">
+                    {movementLog.length} → {optimizedPath.length}
+                  </span>
+                </div>
+              </div>
+            )}
             {mazeData.isGoal && (
               <div className="mt-3 py-2 bg-amber-500/20 border border-amber-500/50 rounded text-center text-amber-400 text-xs font-bold animate-pulse">
                 🎉 GOAL REACHED!

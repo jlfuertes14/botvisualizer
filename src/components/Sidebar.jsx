@@ -44,15 +44,33 @@ const Gauge = ({ value, label, min = 0, max = 100, color = "#06b6d4", unit = "" 
     );
 };
 
+// Movement action icons
+const ActionIcon = ({ action }) => {
+    const icons = {
+        'forward': '⬆️',
+        'turn_left': '↰',
+        'turn_right': '↱',
+        'u_turn': '🔄',
+        'backward': '⬇️',
+        'run_start': '🚀',
+        'goal_reached': '🎉',
+    };
+    return <span className="text-lg">{icons[action] || '•'}</span>;
+};
+
 export function Sidebar({
     sensorData,
     mazeData,
-    episodeHistory = [],
+    movementLog = [],
+    optimizedPath = [],
+    runHistory = [],
+    robotPathStatus = { hasSavedPath: false, pathLength: 0 },
     isConnected,
     isConnecting,
     error,
     onConnect,
     onDisconnect,
+    onSendCommand,
     onDemoData,
     onDemoMazeData,
     onResetMaze,
@@ -69,73 +87,84 @@ export function Sidebar({
     onStartCornerChange,
     onGoalCornerChange,
     onMazeWallsChange,
-    onMazeChange
+    onMazeChange,
+    // Maze control handlers
+    onStartMaze,
+    onStopMaze,
+    // Path saving handlers
+    onSendOptimizedPath,
+    onClearRobotPath
 }) {
-    const [ipAddress, setIpAddress] = useState('botvisualizer-production.up.railway.app');  // Update after deploying
+    const [ipAddress, setIpAddress] = useState('botvisualizer-production.up.railway.app');
     const [port, setPort] = useState('443');
     const [isDemoMode, setIsDemoMode] = useState(false);
     const [activeTab, setActiveTab] = useState('controls');
     const demoIntervalRef = useRef(null);
-    const mazeDemoRef = useRef({ x: 0, y: 0, heading: 0, episode: 1, step: 0 });
+    const mazeDemoRef = useRef({ x: 0, y: 0, heading: 0, run: 1, move: 0 });
+    const demoMovementsRef = useRef([]);
 
-    // Maze demo simulation
+    // Maze demo simulation - now simulates wall follower movements
     const startMazeDemo = useCallback(() => {
         setIsDemoMode(true);
         const demo = mazeDemoRef.current;
-        // Start at the configured start cell
         demo.x = startCell?.x ?? 0;
         demo.y = startCell?.y ?? 0;
         demo.heading = 0;
-        demo.episode = 1;
-        demo.step = 0;
+        demo.run = 1;
+        demo.move = 0;
+        demoMovementsRef.current = [];
 
         demoIntervalRef.current = setInterval(() => {
-            demo.step++;
+            demo.move++;
 
-            // Random movement simulation
-            const rand = Math.random();
-            if (rand < 0.4) {
-                // Move forward
+            // Simulate wall follower behavior
+            const actions = ['forward', 'forward', 'forward', 'turn_left', 'turn_right', 'forward'];
+            const action = actions[Math.floor(Math.random() * actions.length)];
+
+            // Update position based on action
+            if (action === 'forward') {
                 if (demo.heading === 0) demo.y = Math.max(0, demo.y - 1);
                 else if (demo.heading === 90) demo.x = Math.min(4, demo.x + 1);
                 else if (demo.heading === 180) demo.y = Math.min(4, demo.y + 1);
                 else demo.x = Math.max(0, demo.x - 1);
-            } else if (rand < 0.7) {
-                demo.heading = (demo.heading + 90) % 360;
-            } else {
+            } else if (action === 'turn_left') {
                 demo.heading = (demo.heading - 90 + 360) % 360;
+            } else if (action === 'turn_right') {
+                demo.heading = (demo.heading + 90) % 360;
             }
 
-            // Check if robot reached the configured goal cell
             const isGoal = demo.x === (goalCell?.x ?? 4) && demo.y === (goalCell?.y ?? 4);
+
+            // Add to demo movements
+            demoMovementsRef.current.push({ action, heading: demo.heading });
 
             onDemoMazeData?.({
                 position: { x: demo.x, y: demo.y },
                 heading: demo.heading,
                 walls: { front: Math.random() > 0.5, left: Math.random() > 0.7, right: Math.random() > 0.7 },
-                episode: demo.episode,
-                step: demo.step,
-                reward: isGoal ? 100 : -1,
+                run: demo.run,
+                move: demo.move,
+                action: action,
                 isGoal,
                 timestamp: Date.now()
             });
 
-            // Also update legacy sensor data
             onDemoData?.({
                 yaw: demo.heading,
-                accelX: 0,
-                accelY: 0.3,
-                accelZ: 1,
-                direction: 'forward',
+                front: Math.random() * 30,
+                left: Math.random() * 30,
+                right: Math.random() * 30,
+                direction: action === 'forward' ? 'forward' : 'stop',
                 speed: 0.3,
                 timestamp: Date.now()
             });
 
             if (isGoal) {
-                demo.episode++;
+                demo.run++;
                 demo.x = startCell?.x ?? 0;
                 demo.y = startCell?.y ?? 0;
-                demo.step = 0;
+                demo.move = 0;
+                demoMovementsRef.current = [];
             }
         }, 800);
     }, [onDemoData, onDemoMazeData, startCell, goalCell]);
@@ -143,14 +172,14 @@ export function Sidebar({
     const stopDemo = useCallback(() => {
         setIsDemoMode(false);
         if (demoIntervalRef.current) clearInterval(demoIntervalRef.current);
-        onDemoData?.({ yaw: 0, accelX: 0, accelY: 0, accelZ: 1, direction: 'stop', speed: 0, timestamp: Date.now() });
+        onDemoData?.({ yaw: 0, front: 0, left: 0, right: 0, direction: 'stop', speed: 0, timestamp: Date.now() });
         onDemoMazeData?.({
             position: { x: 0, y: 0 },
             heading: 0,
             walls: { front: false, left: false, right: false },
-            episode: 0,
-            step: 0,
-            reward: 0,
+            run: 0,
+            move: 0,
+            action: '',
             isGoal: false,
             timestamp: Date.now()
         });
@@ -171,7 +200,7 @@ export function Sidebar({
                     {mazeMode ? <IconMaze className="w-7 h-7 text-cyan-400" /> : <IconCar className="w-7 h-7 text-cyan-400" />}
                 </div>
                 <h1 className="text-lg font-black tracking-[0.15em] text-white uppercase">
-                    Maze Solver <span className="text-cyan-400">3D</span>
+                    Maze Solver<span className="text-cyan-400">3D</span>
                 </h1>
             </div>
 
@@ -295,6 +324,133 @@ export function Sidebar({
                             <span className="relative z-10">{isDemoMode ? 'Stop Demo' : '▶ Start Demo'}</span>
                         </button>
 
+                        {/* Robot Control - Only when connected */}
+                        {isConnected && (
+                            <div className="space-y-3">
+                                <h2 className="text-[10px] text-slate-500 uppercase tracking-[0.2em] font-bold">Robot Control</h2>
+
+                                {/* Start/Stop/Reset */}
+                                <div className="grid grid-cols-3 gap-2">
+                                    <button
+                                        onClick={onStartMaze}
+                                        className="py-2 rounded-lg text-xs font-bold uppercase bg-emerald-500/10 border border-emerald-500/50 text-emerald-400 hover:bg-emerald-500/20 transition-all"
+                                    >
+                                        ▶ Start
+                                    </button>
+                                    <button
+                                        onClick={onStopMaze}
+                                        className="py-2 rounded-lg text-xs font-bold uppercase bg-red-500/10 border border-red-500/50 text-red-400 hover:bg-red-500/20 transition-all"
+                                    >
+                                        ⏹ Stop
+                                    </button>
+                                    <button
+                                        onClick={() => onSendCommand?.('reset')}
+                                        className="py-2 rounded-lg text-xs font-bold uppercase bg-amber-500/10 border border-amber-500/50 text-amber-400 hover:bg-amber-500/20 transition-all"
+                                    >
+                                        ↻ Reset
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Movement Feed - Wall Follower Actions */}
+                        {mazeMode && (movementLog.length > 0 || isDemoMode) && (
+                            <div className="space-y-3">
+                                <h2 className="text-[10px] text-slate-500 uppercase tracking-[0.2em] font-bold">📍 Movement Feed</h2>
+                                <div className="bg-[#1e293b]/30 p-3 rounded-xl border border-[#334155]/30 space-y-2 max-h-32 overflow-y-auto">
+                                    {(movementLog.length > 0 ? movementLog.slice(-5).reverse() : []).map((m, i) => (
+                                        <div key={i} className="flex items-center gap-2 text-xs">
+                                            <ActionIcon action={m.action} />
+                                            <span className="text-slate-300 uppercase font-mono">{m.action.replace('_', ' ')}</span>
+                                            <span className="ml-auto text-slate-500 font-mono text-[10px]">
+                                                {m.heading?.toFixed(0)}°
+                                            </span>
+                                        </div>
+                                    ))}
+                                    {movementLog.length === 0 && isDemoMode && (
+                                        <p className="text-slate-500 text-xs text-center">Waiting for movements...</p>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Path Optimization Stats */}
+                        {mazeMode && movementLog.length > 0 && (
+                            <div className="space-y-3">
+                                <h2 className="text-[10px] text-slate-500 uppercase tracking-[0.2em] font-bold">🧠 Path Optimization</h2>
+                                <div className="bg-linear-to-r from-purple-900/20 to-cyan-900/20 p-3 rounded-xl border border-purple-500/30">
+                                    <div className="flex justify-between items-center">
+                                        <div>
+                                            <p className="text-xs text-slate-400">Raw Moves</p>
+                                            <p className="text-xl font-bold text-white font-mono">{movementLog.length}</p>
+                                        </div>
+                                        <div className="text-2xl text-purple-400">→</div>
+                                        <div className="text-right">
+                                            <p className="text-xs text-slate-400">Optimized</p>
+                                            <p className="text-xl font-bold text-emerald-400 font-mono">{optimizedPath.length}</p>
+                                        </div>
+                                    </div>
+                                    {movementLog.length > optimizedPath.length && (
+                                        <p className="text-xs text-emerald-400 mt-2 text-center">
+                                            ✨ {movementLog.length - optimizedPath.length} redundant moves eliminated!
+                                        </p>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Robot Memory - Save path to EEPROM */}
+                        {mazeMode && isConnected && (
+                            <div className="space-y-3">
+                                <h2 className="text-[10px] text-slate-500 uppercase tracking-[0.2em] font-bold">💾 Robot Memory</h2>
+                                <div className="bg-[#1e293b]/30 p-3 rounded-xl border border-[#334155]/30 space-y-3">
+                                    {/* Status indicator */}
+                                    <div className={`p-2 rounded-lg text-center text-xs font-bold ${robotPathStatus.hasSavedPath
+                                            ? 'bg-emerald-900/30 border border-emerald-500/50 text-emerald-400'
+                                            : 'bg-slate-800/50 border border-slate-600 text-slate-400'
+                                        }`}>
+                                        {robotPathStatus.hasSavedPath
+                                            ? `✓ ${robotPathStatus.pathLength} moves saved on robot`
+                                            : '• No path saved on robot'
+                                        }
+                                    </div>
+
+                                    {/* Action buttons */}
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <button
+                                            onClick={() => onSendOptimizedPath?.(optimizedPath)}
+                                            disabled={optimizedPath.length === 0}
+                                            className={`py-2 rounded-lg text-xs font-bold uppercase transition-all border ${optimizedPath.length > 0
+                                                    ? 'bg-cyan-500/10 border-cyan-500/50 text-cyan-400 hover:bg-cyan-500/20'
+                                                    : 'bg-slate-800/50 border-slate-700 text-slate-600 cursor-not-allowed'
+                                                }`}
+                                        >
+                                            📤 Send Path
+                                        </button>
+                                        <button
+                                            onClick={onClearRobotPath}
+                                            disabled={!robotPathStatus.hasSavedPath}
+                                            className={`py-2 rounded-lg text-xs font-bold uppercase transition-all border ${robotPathStatus.hasSavedPath
+                                                    ? 'bg-red-500/10 border-red-500/50 text-red-400 hover:bg-red-500/20'
+                                                    : 'bg-slate-800/50 border-slate-700 text-slate-600 cursor-not-allowed'
+                                                }`}
+                                        >
+                                            🗑️ Clear
+                                        </button>
+                                    </div>
+
+                                    <p className="text-[10px] text-slate-500 text-center">
+                                        {robotPathStatus.hasSavedPath
+                                            ? 'Reboot robot → Fast blink → Speed run!'
+                                            : optimizedPath.length > 0
+                                                ? `Ready to send ${optimizedPath.length} optimized moves`
+                                                : 'Explore maze to generate path'
+                                        }
+                                    </p>
+                                </div>
+                            </div>
+                        )}
+
                         {/* Telemetry (Maze Mode) */}
                         {mazeMode && mazeData && (
                             <div className="space-y-3">
@@ -302,12 +458,60 @@ export function Sidebar({
                                 <div className="grid grid-cols-2 gap-3 bg-[#1e293b]/30 p-3 rounded-xl border border-[#334155]/30">
                                     <Gauge value={mazeData.heading || 0} min={0} max={360} label="Heading" unit="°" color="#06b6d4" />
                                     <Gauge
-                                        value={Math.abs(mazeData.step || 0)}
+                                        value={Math.abs(mazeData.move || 0)}
                                         min={0}
                                         max={100}
-                                        label="Steps"
+                                        label="Moves"
                                         color={mazeData.isGoal ? '#10b981' : '#8b5cf6'}
                                     />
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Ultrasonic Sensors Debug */}
+                        {mazeMode && sensorData && (
+                            <div className="space-y-3">
+                                <h2 className="text-[10px] text-slate-500 uppercase tracking-[0.2em] font-bold">🔊 Ultrasonic Sensors</h2>
+                                <div className="bg-[#1e293b]/30 p-3 rounded-xl border border-[#334155]/30 space-y-2">
+                                    {/* Front Sensor */}
+                                    <div className="flex items-center gap-2">
+                                        <span className="text-xs text-slate-400 w-12">Front</span>
+                                        <div className="flex-1 h-4 bg-slate-800 rounded-full overflow-hidden">
+                                            <div
+                                                className={`h-full transition-all duration-200 ${sensorData.wallFront ? 'bg-red-500' : 'bg-cyan-500'}`}
+                                                style={{ width: `${Math.min(100, ((sensorData.front || 0) / 50) * 100)}%` }}
+                                            />
+                                        </div>
+                                        <span className={`text-xs font-mono w-14 text-right ${sensorData.wallFront ? 'text-red-400' : 'text-cyan-300'}`}>
+                                            {(sensorData.front || 0).toFixed(1)} cm
+                                        </span>
+                                    </div>
+                                    {/* Left Sensor */}
+                                    <div className="flex items-center gap-2">
+                                        <span className="text-xs text-slate-400 w-12">Left</span>
+                                        <div className="flex-1 h-4 bg-slate-800 rounded-full overflow-hidden">
+                                            <div
+                                                className={`h-full transition-all duration-200 ${sensorData.wallLeft ? 'bg-red-500' : 'bg-emerald-500'}`}
+                                                style={{ width: `${Math.min(100, ((sensorData.left || 0) / 50) * 100)}%` }}
+                                            />
+                                        </div>
+                                        <span className={`text-xs font-mono w-14 text-right ${sensorData.wallLeft ? 'text-red-400' : 'text-emerald-300'}`}>
+                                            {(sensorData.left || 0).toFixed(1)} cm
+                                        </span>
+                                    </div>
+                                    {/* Right Sensor */}
+                                    <div className="flex items-center gap-2">
+                                        <span className="text-xs text-slate-400 w-12">Right</span>
+                                        <div className="flex-1 h-4 bg-slate-800 rounded-full overflow-hidden">
+                                            <div
+                                                className={`h-full transition-all duration-200 ${sensorData.wallRight ? 'bg-red-500' : 'bg-purple-500'}`}
+                                                style={{ width: `${Math.min(100, ((sensorData.right || 0) / 50) * 100)}%` }}
+                                            />
+                                        </div>
+                                        <span className={`text-xs font-mono w-14 text-right ${sensorData.wallRight ? 'text-red-400' : 'text-purple-300'}`}>
+                                            {(sensorData.right || 0).toFixed(1)} cm
+                                        </span>
+                                    </div>
                                 </div>
                             </div>
                         )}
@@ -345,27 +549,27 @@ export function Sidebar({
 
                 {activeTab === 'history' && (
                     <div className="space-y-3">
-                        <h2 className="text-[10px] text-slate-500 uppercase tracking-[0.2em] font-bold">Episode History</h2>
-                        {episodeHistory.length === 0 ? (
-                            <p className="text-slate-500 text-sm text-center py-8">No episodes yet</p>
+                        <h2 className="text-[10px] text-slate-500 uppercase tracking-[0.2em] font-bold">Run History</h2>
+                        {runHistory.length === 0 ? (
+                            <p className="text-slate-500 text-sm text-center py-8">No runs yet</p>
                         ) : (
                             <div className="space-y-2">
-                                {episodeHistory.slice(-10).reverse().map((ep, i) => (
+                                {runHistory.slice(-10).reverse().map((run, i) => (
                                     <div
                                         key={i}
-                                        className={`p-3 rounded-lg border ${ep.solved
+                                        className={`p-3 rounded-lg border ${run.solved
                                             ? 'bg-emerald-900/20 border-emerald-500/30'
                                             : 'bg-slate-800/50 border-slate-700'
                                             }`}
                                     >
                                         <div className="flex justify-between items-center">
-                                            <span className="text-xs font-bold text-slate-300">Episode {ep.episode}</span>
-                                            {ep.solved && <span className="text-xs text-emerald-400">✓ Solved</span>}
+                                            <span className="text-xs font-bold text-slate-300">Run {run.run}</span>
+                                            {run.solved && <span className="text-xs text-emerald-400">✓ Solved</span>}
                                         </div>
                                         <div className="flex justify-between mt-1 text-xs text-slate-500">
-                                            <span>{ep.steps} steps</span>
-                                            <span className={ep.reward >= 0 ? 'text-emerald-400' : 'text-red-400'}>
-                                                {ep.reward > 0 ? '+' : ''}{ep.reward?.toFixed(0)}
+                                            <span>{run.moves} moves</span>
+                                            <span className="text-purple-400">
+                                                Optimized: {run.optimizedMoves}
                                             </span>
                                         </div>
                                     </div>

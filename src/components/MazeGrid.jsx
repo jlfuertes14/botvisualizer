@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import * as THREE from 'three';
 
 /**
- * 5x5 Maze Grid Component for Q-Learning Visualizer
+ * 5x5 Maze Grid Component for Wall Follower Visualizer
  * Shows grid, discovered walls, start/goal cells, and robot path
  */
 
@@ -190,16 +190,24 @@ function DiscoveredWalls({ discoveredWalls, cellSize, wallHeight, offset }) {
 
 // Path trail showing robot's journey
 function PathTrail({ pathHistory, cellSize, offset }) {
-    if (pathHistory.length < 2) return null;
+    // Filter out any invalid path entries and require at least 2 valid points
+    const validPoints = useMemo(() => {
+        if (!pathHistory || !Array.isArray(pathHistory)) return [];
 
-    const points = pathHistory.map((pos, i) => {
-        const x = pos.x * cellSize + offset;
-        const z = pos.y * cellSize + offset;
-        const y = 0.1;
-        return new THREE.Vector3(x, y, z);
-    });
+        return pathHistory
+            .filter(pos => pos && typeof pos.x === 'number' && typeof pos.y === 'number')
+            .map(pos => {
+                const x = pos.x * cellSize + offset;
+                const z = pos.y * cellSize + offset;
+                const y = 0.1;
+                return new THREE.Vector3(x, y, z);
+            });
+    }, [pathHistory, cellSize, offset]);
 
-    const curve = new THREE.CatmullRomCurve3(points);
+    // Need at least 2 points to create a curve
+    if (validPoints.length < 2) return null;
+
+    const curve = new THREE.CatmullRomCurve3(validPoints);
 
     return (
         <mesh>
